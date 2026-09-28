@@ -74,8 +74,21 @@ type lot struct {
 	entry                       time.Time
 }
 
-// Run executes one backtest.
+// Planner is any strategy the backtester (and the live runner) can drive:
+// it sees data truncated at the decision date and returns target weights.
+type Planner interface {
+	Reconcile(held map[string]float64)
+	MarkRejected(sym string)
+	Plan(data market.Dataset) (*strategy.Plan, error)
+}
+
+// Run backtests the swing strategy.
 func Run(ctx context.Context, cfg *config.Config, data market.Dataset, opt Options) (*Result, error) {
+	return RunWith(ctx, cfg, data, strategy.New(cfg, nil), opt)
+}
+
+// RunWith backtests any Planner with the same fills, risk engine and metrics.
+func RunWith(ctx context.Context, cfg *config.Config, data market.Dataset, strat Planner, opt Options) (*Result, error) {
 	bench, ok := data[cfg.Benchmark]
 	if !ok || len(bench) == 0 {
 		return nil, fmt.Errorf("benchmark %s has no data", cfg.Benchmark)
@@ -90,7 +103,6 @@ func Run(ctx context.Context, cfg *config.Config, data market.Dataset, opt Optio
 		return nil, fmt.Errorf("not enough benchmark bars in range")
 	}
 
-	strat := strategy.New(cfg, nil)
 	rk := risk.New(cfg, nil, "")
 	managed := map[string]bool{}
 	for _, s := range cfg.Symbols() {

@@ -499,3 +499,10 @@ func findNum(v any, keys []string) (float64, bool) {
 	}
 	return 0, false
 }
+
+// NewRobinhoodNative builds the direct MCP broker for a config; its OAuth
+// token lives in <state_dir>/robinhood-native.
+func NewRobinhoodNative(cfg *config.Config, interactive bool, out io.Writer) *RobinhoodNative {
+	return &RobinhoodNative{Cfg: cfg.Robinhood, StateDir: filepath.Join(cfg.StateDir, "robinhood-native"),
+		Interactive: interactive, Out: out}
+}

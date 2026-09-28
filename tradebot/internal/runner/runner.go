@@ -22,7 +22,6 @@ import (
 	"github.com/midhunvinay1/tradebot/internal/config"
 	"github.com/midhunvinay1/tradebot/internal/data"
 	"github.com/midhunvinay1/tradebot/internal/journal"
-	"github.com/midhunvinay1/tradebot/internal/llm"
 	"github.com/midhunvinay1/tradebot/internal/market"
 	"github.com/midhunvinay1/tradebot/internal/notify"
 	"github.com/midhunvinay1/tradebot/internal/portfolio"
@@ -67,9 +66,48 @@ func (CSVSource) IsTradingDay(_ context.Context, d time.Time) (bool, error) {
 	return d.Weekday() != time.Saturday && d.Weekday() != time.Sunday, nil
 }
 
+// Planner is the strategy a runner drives (swing, trend, ...).
+type Planner interface {
+	Reconcile(held map[string]float64)
+	MarkRejected(sym string)
+	Plan(data market.Dataset) (*strategy.Plan, error)
+	State() any // persisted as JSON between runs
+}
+
+// PlannerFactory restores a planner from its persisted state (nil = fresh).
+type PlannerFactory func(state json.RawMessage) (Planner, error)
+
+// SwingPlanner is the factory for the swing strategy.
+func SwingPlanner(cfg *config.Config) PlannerFactory {
+	return func(raw json.RawMessage) (Planner, error) {
+		st := strategy.NewState()
+		if len(raw) > 0 && string(raw) != "null" {
+			if err := json.Unmarshal(raw, st); err != nil {
+				return nil, fmt.Errorf("strategy state: %w", err)
+			}
+		}
+		return strategy.New(cfg, st), nil
+	}
+}
+
+// Entry is one new position offered to an EntryReviewer.
+type Entry struct {
+	Order    portfolio.Order
+	Plan     *strategy.Plan
+	Data     market.Dataset
+	Holdings []string
+	Now      time.Time
+}
+
+// EntryReviewer can shrink or veto new entries (multiplier in [0,1]). It is
+// optional: a nil reviewer means pure rule-based trading.
+type EntryReviewer interface {
+	ReviewEntry(ctx context.Context, e Entry) (mult float64, note string)
+}
+
 // Persisted is the bot's state between runs.
 type Persisted struct {
-	Strategy    *strategy.State `json:"strategy"`
+	Strategy    json.RawMessage `json:"strategy"`
 	Risk        *risk.State     `json:"risk"`
 	LastRunDate time.Time       `json:"last_run_date"`
 }
@@ -77,7 +115,7 @@ type Persisted struct {
 func statePath(dir string) string { return filepath.Join(dir, "state.json") }
 
 func LoadState(dir string) (*Persisted, error) {
-	p := &Persisted{Strategy: strategy.NewState(), Risk: &risk.State{}}
+	p := &Persisted{Risk: &risk.State{}}
 	b, err := os.ReadFile(statePath(dir))
 	if errors.Is(err, os.ErrNotExist) {
 		return p, nil
@@ -86,6 +124,9 @@ func LoadState(dir string) (*Persisted, error) {
 	}
 	if err := json.Unmarshal(b, p); err != nil {
 		return nil, fmt.Errorf("corrupt state file %s: %w", statePath(dir), err)
+	}
+	if p.Risk == nil {
+		p.Risk = &risk.State{}
 	}
 	return p, nil
 }
@@ -106,16 +147,17 @@ func SaveState(dir string, p *Persisted) error {
 }
 
 type Runner struct {
-	Cfg      *config.Config
-	StateDir string
-	Broker   broker.Broker
-	Data     DataSource
-	Reviewer llm.Reviewer
-	Journal  *journal.Journal
-	Notify   *notify.Notifier
-	Now      func() time.Time
-	Force    bool
-	Out      io.Writer
+	Cfg        *config.Config
+	StateDir   string
+	Broker     broker.Broker
+	Data       DataSource
+	NewPlanner PlannerFactory
+	Reviewer   EntryReviewer // nil = no review
+	Journal    *journal.Journal
+	Notify     *notify.Notifier
+	Now        func() time.Time
+	Force      bool
+	Out        io.Writer
 }
 
 func (r *Runner) logf(format string, a ...any) { fmt.Fprintf(r.Out, format+"\n", a...) }
@@ -164,7 +206,10 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 	lastBar := bench.Last().Date
 
-	strat := strategy.New(cfg, st.Strategy)
+	strat, err := r.NewPlanner(st.Strategy)
+	if err != nil {
+		return err
+	}
 	strat.Reconcile(held)
 	rk.Update(acct.Equity, today)
 	plan, err := strat.Plan(ds)
@@ -201,18 +246,19 @@ func (r *Runner) Run(ctx context.Context) error {
 		Date: today, Targets: targets, Held: held, Prices: prices, Equity: acct.Equity, Managed: managed, Reasons: plan.OrderReasons(),
 	}, cfg.Execution)
 
-	// Claude overlay: review new entries only; it can shrink or veto, never grow.
+	// Optional entry review (e.g. the Claude overlay): it can shrink or veto
+	// new entries, never grow them.
 	var holdings []string
 	for s := range held {
 		holdings = append(holdings, s)
 	}
 	sort.Strings(holdings)
-	calls := 0
 	kept := orders[:0]
 	var verdictLines []string
 	for _, o := range orders {
-		if o.Kind == portfolio.KindEntry && o.Side == portfolio.Buy && o.Symbol != cfg.Defensive && cfg.LLM.Enabled && cfg.LLM.ReviewNewEntries {
-			mult, line := r.review(ctx, &calls, o, plan, ds, holdings, now)
+		if r.Reviewer != nil && o.Kind == portfolio.KindEntry && o.Side == portfolio.Buy && o.Symbol != cfg.Defensive {
+			mult, line := r.Reviewer.ReviewEntry(ctx, Entry{Order: o, Plan: plan, Data: ds, Holdings: holdings, Now: now})
+			mult = math.Max(0, math.Min(1, mult))
 			verdictLines = append(verdictLines, line)
 			o.Qty = portfolio.RoundQty(o.Qty*mult, cfg.Execution.AllowFractional)
 			if o.Qty <= 0 {
@@ -245,7 +291,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	results, subErr := r.Broker.Submit(ctx, approved)
 	_ = r.Journal.Log("results", map[string]any{"broker": r.Broker.Name(), "results": results, "error": errString(subErr)})
 
-	st.Strategy, st.Risk, st.LastRunDate = strat.St, rk.St, today
+	raw, err := json.Marshal(strat.State())
+	if err != nil {
+		return fmt.Errorf("save strategy state: %w", err)
+	}
+	st.Strategy, st.Risk, st.LastRunDate = raw, rk.St, today
 	if err := SaveState(r.StateDir, st); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}
@@ -259,30 +309,6 @@ func (r *Runner) Run(ctx context.Context) error {
 		return fmt.Errorf("submit: %w", subErr)
 	}
 	return nil
-}
-
-func (r *Runner) review(ctx context.Context, calls *int, o portfolio.Order, plan *strategy.Plan, ds market.Dataset, holdings []string, now time.Time) (float64, string) {
-	cfg := r.Cfg.LLM
-	fallback := 0.0
-	if cfg.OnError == "allow" {
-		fallback = 1
-	}
-	if *calls >= cfg.MaxCallsPerRun {
-		return fallback, fmt.Sprintf("%s: review budget exhausted → multiplier %.2f", o.Symbol, fallback)
-	}
-	*calls++
-	news, err := r.Data.News(ctx, o.Symbol, now.AddDate(0, 0, -cfg.NewsLookbackDays), cfg.MaxHeadlines)
-	if err != nil {
-		r.logf("warning: news for %s unavailable: %v", o.Symbol, err)
-	}
-	cand := llm.BuildCandidate(plan.Date, o.Symbol, plan.Sleeve[o.Symbol], plan.Reasons[o.Symbol], o.TargetWeight, ds[o.Symbol], plan.RiskOn, holdings, news)
-	v, err := r.Reviewer.Review(ctx, cand)
-	if err != nil {
-		_ = r.Journal.Log("llm_error", map[string]any{"symbol": o.Symbol, "error": err.Error()})
-		return fallback, fmt.Sprintf("%s: review failed (%v) → multiplier %.2f", o.Symbol, err, fallback)
-	}
-	_ = r.Journal.Log("llm_verdict", map[string]any{"candidate": cand, "verdict": v})
-	return v.Multiplier(), fmt.Sprintf("%s: %s ×%.2f %v — %s", o.Symbol, v.Decision, v.Multiplier(), v.RiskFlags, v.Rationale)
 }
 
 func (r *Runner) summary(plan *strategy.Plan, scale float64, acct broker.Account, approved []portfolio.Order, rejected []risk.Rejection, results []broker.Result, verdicts []string, rk *risk.Engine) string {
@@ -310,7 +336,7 @@ func (r *Runner) summary(plan *strategy.Plan, scale float64, acct broker.Account
 		fmt.Fprintf(&b, "  exit %-6s %s\n", s, why)
 	}
 	for _, v := range verdicts {
-		fmt.Fprintf(&b, "Claude: %s\n", v)
+		fmt.Fprintf(&b, "Review: %s\n", v)
 	}
 	for _, o := range approved {
 		fmt.Fprintf(&b, "APPROVED %-4s %g %s @ %.2f (%s)\n", o.Side, o.Qty, o.Symbol, o.LimitPrice, o.Kind)

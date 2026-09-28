@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -10,9 +11,9 @@ import (
 	"github.com/midhunvinay1/tradebot/internal/broker"
 	"github.com/midhunvinay1/tradebot/internal/config"
 	"github.com/midhunvinay1/tradebot/internal/data"
-	"github.com/midhunvinay1/tradebot/internal/llm"
 	"github.com/midhunvinay1/tradebot/internal/market"
 	"github.com/midhunvinay1/tradebot/internal/portfolio"
+	"github.com/midhunvinay1/tradebot/internal/strategy"
 )
 
 type memSource struct{ ds market.Dataset }
@@ -38,9 +39,9 @@ func (r *recBroker) Submit(ctx context.Context, o []portfolio.Order) ([]broker.R
 
 type vetoAll struct{ calls int }
 
-func (v *vetoAll) Review(context.Context, llm.Candidate) (llm.Verdict, error) {
+func (v *vetoAll) ReviewEntry(context.Context, Entry) (float64, string) {
 	v.calls++
-	return llm.Verdict{Decision: "veto", Rationale: "test"}, nil
+	return 0, "veto (test)"
 }
 
 // setup returns synthetic data ending the day before `now` whose last
@@ -57,7 +58,7 @@ func TestRunPlacesApprovedOrdersOncePerDay(t *testing.T) {
 	cfg, ds, now := setup(t)
 	b := &recBroker{DryRun: broker.DryRun{Equity: 10000}}
 	var out bytes.Buffer
-	r := &Runner{Cfg: cfg, StateDir: t.TempDir(), Broker: b, Data: memSource{ds}, Reviewer: llm.ApproveAll{},
+	r := &Runner{Cfg: cfg, StateDir: t.TempDir(), Broker: b, Data: memSource{ds}, NewPlanner: SwingPlanner(cfg),
 		Now: func() time.Time { return now }, Out: &out}
 	if err := r.Run(context.Background()); err != nil {
 		t.Fatal(err)
@@ -86,7 +87,7 @@ func TestClaudeVetoDropsEntries(t *testing.T) {
 	b := &recBroker{DryRun: broker.DryRun{Equity: 10000}}
 	v := &vetoAll{}
 	var out bytes.Buffer
-	r := &Runner{Cfg: cfg, StateDir: t.TempDir(), Broker: b, Data: memSource{ds}, Reviewer: v,
+	r := &Runner{Cfg: cfg, StateDir: t.TempDir(), Broker: b, Data: memSource{ds}, NewPlanner: SwingPlanner(cfg), Reviewer: v,
 		Now: func() time.Time { return now }, Out: &out}
 	if err := r.Run(context.Background()); err != nil {
 		t.Fatal(err)
@@ -103,7 +104,11 @@ func TestClaudeVetoDropsEntries(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(st.Strategy.MeanRev) != 0 {
+	var ss strategy.State
+	if err := json.Unmarshal(st.Strategy, &ss); err != nil {
+		t.Fatal(err)
+	}
+	if len(ss.MeanRev) != 0 {
 		t.Fatal("vetoed mean-reversion entries must be dropped from strategy state")
 	}
 }

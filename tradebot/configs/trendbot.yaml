@@ -1,0 +1,64 @@
+# trendbot: LLM-free multi-asset trend following with momentum rotation and
+# volatility targeting. Values not listed here use the built-in defaults.
+
+# 11 liquid ETFs across asset classes. Any subset/superset works; keep them diverse.
+universe:
+  - SPY   # US large caps
+  - QQQ   # US growth/tech
+  - IWM   # US small caps
+  - EFA   # developed international
+  - EEM   # emerging markets
+  - VNQ   # US real estate
+  - TLT   # long Treasuries
+  - IEF   # intermediate Treasuries
+  - LQD   # investment-grade corporates
+  - GLD   # gold
+  - DBC   # broad commodities
+benchmark: SPY
+defensive: SGOV   # T-bill ETF for unused capital. SGOV starts 2020-06: use BIL for backtests before that.
+
+trend:
+  lookbacks: [21, 63, 126, 252]   # 1, 3, 6, 12 months, averaged ("13612U")
+  top_k: 4                        # asset slots; an asset must also beat T-bills to fill one
+  vol_window: 63                  # inverse-volatility weights and covariance
+  target_vol: 0.15                # scale down if ex-ante portfolio vol exceeds 15%/yr (never lever up)
+  max_weight: 0.35                # per asset; excess stays in T-bills
+  rebalance: month                # month (first trading day) or week
+
+execution:
+  entry_limit_bps: 30
+  exit_limit_bps: 60
+  rebalance_band: 0.02            # skip resizes smaller than 2% of equity
+  allow_fractional: false         # whole shares: works best above ~$5k
+  min_order_notional: 25
+
+risk:
+  max_position_weight: 0.40       # the T-bill ETF is exempt
+  max_gross_exposure: 1.0         # no leverage
+  max_orders_per_run: 24
+  max_turnover_per_run: 2.1       # a full monthly rotation is a sale plus a purchase
+  daily_loss_limit: 0.04
+  soft_drawdown: 0.15             # halve exposure at -15%
+  soft_drawdown_scale: 0.5
+  hard_drawdown: 0.25             # kill switch at -25% (needs `trendbot resume`)
+  max_price_deviation_bps: 150
+  max_data_age_days: 5
+  halt_allows_exits: true
+
+backtest:
+  initial_equity: 10000
+  slippage_bps: 5
+
+llm:
+  enabled: false                  # trendbot never uses an LLM; this only documents it
+
+robinhood:
+  # Direct MCP client only (no Claude Code executor). Fill these from `trendbot rh-tools`.
+  native:
+    account_tool: ""
+    positions_tool: ""
+    place_order_tool: ""
+    order_status_tool: ""
+    cancel_order_tool: ""
+
+state_dir: state/trendbot

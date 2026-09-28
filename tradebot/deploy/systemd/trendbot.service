@@ -1,0 +1,13 @@
+[Unit]
+Description=trendbot daily check (LLM-free trend following; trades about monthly)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tradebot
+WorkingDirectory=/opt/tradebot
+EnvironmentFile=/opt/tradebot/.env
+# Switch to --broker robinhood-native only after the paper go/no-go (docs/TRENDBOT.md).
+ExecStart=/opt/tradebot/bin/trendbot run --config /opt/tradebot/configs/trendbot.yaml --broker alpaca-paper
+TimeoutStartSec=10min

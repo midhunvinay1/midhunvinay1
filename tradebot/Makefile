@@ -1,11 +1,12 @@
 BIN := bin/tradebot
 CONFIG ?= configs/config.yaml
 
-.PHONY: build test vet synth-backtest fetch backtest sweep paper live status halt resume \
+.PHONY: trendbot check-llm-free trend-synth build test vet synth-backtest fetch backtest sweep paper live status halt resume \
 	synth-intraday fetch-intraday backtest-intraday day-dry day-paper day-live rh-login rh-tools doctor
 
 build:
 	go build -trimpath -o $(BIN) ./cmd/tradebot
+	go build -trimpath -o bin/trendbot ./cmd/trendbot
 
 test:
 	go test ./...
@@ -57,3 +58,16 @@ day-live: build
 
 rh-login rh-tools doctor: build
 	$(BIN) $@ --config $(CONFIG)
+
+## ---- trendbot (LLM-free) ----
+trendbot:
+	go build -trimpath -o bin/trendbot ./cmd/trendbot
+
+check-llm-free:                ## fails if trendbot links any LLM code
+	@if go list -deps ./cmd/trendbot | grep -E 'anthropic|internal/llm'; then \
+		echo "trendbot must not depend on LLM packages"; exit 1; \
+	else echo "trendbot: no LLM dependencies"; fi
+
+trend-synth: trendbot          ## pipeline smoke test on synthetic data (numbers are meaningless)
+	bin/trendbot synth --out data/etf-synth
+	bin/trendbot backtest --data data/etf-synth --out results/trendbot-synth

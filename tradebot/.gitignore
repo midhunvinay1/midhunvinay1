@@ -1,5 +1,7 @@
-bin/
-data/
-results/
-state/
+# Anchored to this directory so they never match source packages
+# (an unanchored "data/" used to hide internal/data/).
+/bin/
+/data/
+/results/
+/state/
 .env
