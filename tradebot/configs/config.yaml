@@ -146,8 +146,74 @@ robinhood:
     limit_price: [limit_price, price, limit]
     order_type: [order_type, type]
   forbidden_input_keys: [strike, strike_price, expiration, expiration_date, option_type, legs, notional, dollar_amount, amount_in_dollars, stop_price, trail_amount]
+  # Direct MCP client (no LLM in the order path; required for intraday).
+  # 1) tradebot rh-login   2) tradebot rh-tools   3) fill in the exact names below   4) tradebot doctor
+  native:
+    server_url: https://agent.robinhood.com/mcp/trading
+    token_file: oauth_token.json      # stored 0600 under state/robinhood-native/
+    callback_port: 3142
+    client_name: tradebot
+    call_timeout_sec: 15
+    account_tool: ""                  # e.g. the portfolio/account summary tool
+    positions_tool: ""                # "" if the account tool already lists positions
+    place_order_tool: ""              # the equity order tool (must match order_tool_keywords)
+    order_status_tool: ""
+    cancel_order_tool: ""
+    numbers_as_strings: false
+    order_args:                       # our field -> the tool's argument name
+      symbol: symbol
+      side: side
+      quantity: quantity
+      limit_price: limit_price
+      order_id: order_id              # argument name for status/cancel tools
+    fixed_args:                       # constant arguments added to every order
+      type: limit
+      time_in_force: gfd
+    result_keys:                      # where to find values in tool results (searched recursively)
+      equity: [equity, total_equity, portfolio_value, total_value]
+      cash: [cash, cash_available, buying_power, cash_balance]
+      positions: [positions, holdings]
+      symbol: [symbol, ticker]
+      quantity: [quantity, qty, shares]
+      avg_price: [average_price, average_buy_price, avg_price, cost_basis_per_share]
+      order_id: [order_id, id]
+      status: [status, state]
+      filled: [filled_quantity, cumulative_quantity, filled_qty]
+      fill_price: [average_fill_price, average_price, filled_avg_price, price]
 
 notify:
   webhook_url_env: TRADEBOT_WEBHOOK_URL   # optional Slack-compatible incoming webhook
+
+# Short-term mode: `tradebot day` (opening-range breakout, always flat by the close).
+# Run ONE mode per account, or give the two modes disjoint universes.
+intraday:
+  universe: []                  # empty = the universe above (liquid names only; ETFs rarely come "in play")
+  opening_range_minutes: 5
+  rvol_lookback_days: 14        # relative volume = today's OR volume / 14-day average OR volume
+  min_rvol: 1.0
+  top_n_in_play: 10
+  min_atr_dollars: 0.5
+  atr_days: 14
+  min_price: 5
+  stop_atr_fraction: 0.10       # stop = entry - 10% of daily ATR
+  breakeven_at_r: 0             # 0 = off; e.g. 1.0 moves the stop to entry after +1R
+  take_profit_r: 0              # 0 = hold winners to the close
+  risk_per_trade: 0.01          # lose at most 1% of equity if the stop is hit
+  max_positions: 4
+  max_position_weight: 0.25     # max_positions x weight <= 1 (no leverage)
+  max_trades_per_day: 8
+  no_entries_after: "15:00"     # New York time
+  flatten_at: "15:55"
+  daily_loss_limit: 0.02        # flatten and stop for the day at -2%
+  day_trade_limit_5d: 0         # 0 = unlimited (FINRA removed the $25k PDT rule; set 3 if your broker still enforces it)
+  account_type: cash            # cash: buys use settled cash only; margin: still no leverage
+  entry_limit_bps: 10           # buy limit = breakout level + 0.10%
+  exit_limit_bps: 30            # sell limit = last price - 0.30%
+  slippage_bps: 3               # backtest cost per side
+  poll_seconds: 2               # price polling interval (Alpaca free tier: 200 requests/min)
+  max_quote_age_seconds: 10     # older quotes never trigger trades
+  order_timeout_seconds: 20     # cancel unfilled orders after this
+  premarket_review: true        # one batched Claude news review at ~09:15 ET
+  news_lookback_hours: 18
 
 state_dir: state

@@ -67,12 +67,29 @@ func (c *Client) do(ctx context.Context, method, rawURL string, body any, out an
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := c.http.Do(req)
+	// Retry idempotent reads on rate limits and server errors; never retry
+	// order submissions (a retried POST could double an order).
+	var resp *http.Response
+	var b []byte
+	for attempt := 0; ; attempt++ {
+		resp, err = c.http.Do(req)
+		if err == nil {
+			b, _ = io.ReadAll(resp.Body)
+			resp.Body.Close()
+		}
+		retryable := method == http.MethodGet && (err != nil || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500)
+		if !retryable || attempt >= 4 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(1<<attempt) * 500 * time.Millisecond):
+		}
+	}
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("alpaca %s %s: %d %s", method, req.URL.Path, resp.StatusCode, strings.TrimSpace(string(b)))
 	}
@@ -95,6 +112,41 @@ type rawBar struct {
 
 // DailyBars fetches split/dividend-adjusted daily bars for [start, end).
 func (c *Client) DailyBars(ctx context.Context, symbols []string, start, end time.Time) (market.Dataset, error) {
+	return c.bars(ctx, symbols, "1Day", start, end, true, c.feed)
+}
+
+// IntradayBars fetches raw-timestamp bars (e.g. timeframe "1Min", "5Min"),
+// regular trading hours only, split-adjusted.
+func (c *Client) IntradayBars(ctx context.Context, symbols []string, timeframe string, start, end time.Time) (market.Dataset, error) {
+	return c.IntradayBarsFeed(ctx, symbols, timeframe, start, end, c.feed)
+}
+
+// IntradayBarsFeed is IntradayBars from an explicit feed ("iex" or "sip").
+// Live intraday code uses the real-time price feed so today's bars are
+// available (free plans cannot query SIP data from the last 15 minutes) and
+// relative volume compares like with like.
+func (c *Client) IntradayBarsFeed(ctx context.Context, symbols []string, timeframe string, start, end time.Time, feed string) (market.Dataset, error) {
+	ds, err := c.bars(ctx, symbols, timeframe, start, end, false, feed)
+	if err != nil {
+		return nil, err
+	}
+	for sym, s := range ds {
+		kept := s[:0]
+		for _, b := range s {
+			ny := b.Date.In(market.NewYork)
+			if m := ny.Hour()*60 + ny.Minute(); m >= 9*60+30 && m < 16*60 {
+				kept = append(kept, b)
+			}
+		}
+		ds[sym] = kept
+	}
+	return ds, nil
+}
+
+// PriceFeed is the configured real-time feed.
+func (c *Client) PriceFeed() string { return c.priceFeed }
+
+func (c *Client) bars(ctx context.Context, symbols []string, timeframe string, start, end time.Time, daily bool, feed string) (market.Dataset, error) {
 	ds := market.Dataset{}
 	for i := 0; i < len(symbols); i += 50 {
 		j := min(i+50, len(symbols))
@@ -102,11 +154,11 @@ func (c *Client) DailyBars(ctx context.Context, symbols []string, start, end tim
 		for {
 			q := url.Values{}
 			q.Set("symbols", strings.Join(symbols[i:j], ","))
-			q.Set("timeframe", "1Day")
+			q.Set("timeframe", timeframe)
 			q.Set("start", start.UTC().Format(time.RFC3339))
 			q.Set("end", end.UTC().Format(time.RFC3339))
 			q.Set("adjustment", "all")
-			q.Set("feed", c.feed)
+			q.Set("feed", feed)
 			q.Set("limit", "10000")
 			if pageToken != "" {
 				q.Set("page_token", pageToken)
@@ -120,9 +172,11 @@ func (c *Client) DailyBars(ctx context.Context, symbols []string, start, end tim
 			}
 			for sym, bars := range resp.Bars {
 				for _, b := range bars {
-					ds[sym] = append(ds[sym], market.Bar{
-						Date: market.TradingDate(b.T), Open: b.O, High: b.H, Low: b.L, Close: b.C, Volume: b.V,
-					})
+					d := b.T.UTC()
+					if daily {
+						d = market.TradingDate(b.T)
+					}
+					ds[sym] = append(ds[sym], market.Bar{Date: d, Open: b.O, High: b.H, Low: b.L, Close: b.C, Volume: b.V})
 				}
 			}
 			if resp.NextPageToken == nil || *resp.NextPageToken == "" {
@@ -132,6 +186,81 @@ func (c *Client) DailyBars(ctx context.Context, symbols []string, start, end tim
 		}
 	}
 	return ds, nil
+}
+
+// Trade is the latest trade for a symbol.
+type Trade struct {
+	Price float64
+	Time  time.Time
+}
+
+// LatestTrades returns the latest trade (price and timestamp) per symbol in
+// one request; intraday loops use the timestamp to reject stale quotes.
+func (c *Client) LatestTrades(ctx context.Context, symbols []string) (map[string]Trade, error) {
+	q := url.Values{}
+	q.Set("symbols", strings.Join(symbols, ","))
+	q.Set("feed", c.priceFeed)
+	var resp struct {
+		Trades map[string]struct {
+			P float64   `json:"p"`
+			T time.Time `json:"t"`
+		} `json:"trades"`
+	}
+	if err := c.do(ctx, http.MethodGet, c.dataURL+"/v2/stocks/trades/latest?"+q.Encode(), nil, &resp); err != nil {
+		return nil, err
+	}
+	out := make(map[string]Trade, len(resp.Trades))
+	for sym, t := range resp.Trades {
+		if t.P > 0 {
+			out[sym] = Trade{Price: t.P, Time: t.T}
+		}
+	}
+	return out, nil
+}
+
+// NewsMulti returns recent headlines for several symbols, grouped by symbol.
+func (c *Client) NewsMulti(ctx context.Context, symbols []string, since time.Time, perSymbol int) (map[string][]market.News, error) {
+	want := map[string]bool{}
+	for _, s := range symbols {
+		want[s] = true
+	}
+	out := map[string][]market.News{}
+	pageToken := ""
+	for page := 0; page < 10; page++ {
+		q := url.Values{}
+		q.Set("symbols", strings.Join(symbols, ","))
+		q.Set("start", since.UTC().Format(time.RFC3339))
+		q.Set("limit", "50")
+		q.Set("sort", "desc")
+		if pageToken != "" {
+			q.Set("page_token", pageToken)
+		}
+		var resp struct {
+			News []struct {
+				Headline  string    `json:"headline"`
+				Summary   string    `json:"summary"`
+				Source    string    `json:"source"`
+				CreatedAt time.Time `json:"created_at"`
+				Symbols   []string  `json:"symbols"`
+			} `json:"news"`
+			NextPageToken *string `json:"next_page_token"`
+		}
+		if err := c.do(ctx, http.MethodGet, c.dataURL+"/v1beta1/news?"+q.Encode(), nil, &resp); err != nil {
+			return nil, err
+		}
+		for _, n := range resp.News {
+			for _, s := range n.Symbols {
+				if want[s] && len(out[s]) < perSymbol {
+					out[s] = append(out[s], market.News{Time: n.CreatedAt, Source: n.Source, Headline: n.Headline, Summary: n.Summary})
+				}
+			}
+		}
+		if resp.NextPageToken == nil || *resp.NextPageToken == "" {
+			break
+		}
+		pageToken = *resp.NextPageToken
+	}
+	return out, nil
 }
 
 // LatestPrices returns the latest trade price per symbol.
@@ -250,6 +379,29 @@ func (c *Client) SubmitOrder(ctx context.Context, o OrderRequest) (OrderResponse
 	var r OrderResponse
 	err := c.do(ctx, http.MethodPost, c.tradeURL+"/v2/orders", o, &r)
 	return r, err
+}
+
+// OrderState is the fill status of one order.
+type OrderState struct {
+	Status      string
+	FilledQty   float64
+	FilledPrice float64
+}
+
+func (c *Client) GetOrder(ctx context.Context, id string) (OrderState, error) {
+	var o struct {
+		Status         string `json:"status"`
+		FilledQty      string `json:"filled_qty"`
+		FilledAvgPrice string `json:"filled_avg_price"`
+	}
+	if err := c.do(ctx, http.MethodGet, c.tradeURL+"/v2/orders/"+url.PathEscape(id), nil, &o); err != nil {
+		return OrderState{}, err
+	}
+	return OrderState{Status: o.Status, FilledQty: atof(o.FilledQty), FilledPrice: atof(o.FilledAvgPrice)}, nil
+}
+
+func (c *Client) CancelOrder(ctx context.Context, id string) error {
+	return c.do(ctx, http.MethodDelete, c.tradeURL+"/v2/orders/"+url.PathEscape(id), nil, nil)
 }
 
 // IsTradingDay reports whether the exchange has a session on the given NY date.

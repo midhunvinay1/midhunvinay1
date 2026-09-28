@@ -1,109 +1,114 @@
 # Prompts to finish the bot with Claude Code
 
-The bot is functional: strategy, risk engine, backtester, sweep, Alpaca paper trading, the Robinhood executor with its guard, and tests. The tasks below need **your** credentials, data or accounts, so they could not be finished in the build sandbox.
+## Status
+
+| # | Task | Status |
+|---|---|---|
+| 3 | Native MCP client (no LLM in the order path) | ✅ **Done**: `robinhood-native`, `rh-login`, `rh-tools`, with an OAuth flow test |
+| 7 | Pre-live hardening | ✅ **Mostly done**: single-instance lock, `doctor`, read retries with backoff, per-call timeouts, order status/cancel. **Remaining:** structured logging |
+| — | Short-term / intraday mode | ✅ **Done**: ORB engine, minute backtester, live loop (`tradebot day`), pre-market Claude review. See [INTRADAY.md](INTRADAY.md) |
+| 1 | Real-data backtests (both modes) | ⏳ Needs your Alpaca keys (market data was blocked in the build sandbox) |
+| 2 | Map the real Robinhood tools | ⏳ Needs your Robinhood login; now a 10-minute job with `rh-tools` |
+| 4 | Deterministic earnings blackout | ⏳ Needs an earnings-calendar source |
+| 5 | Survivorship-free universe | ⏳ Optional research |
+| 6 | Weekly report and Claude critique | ⏳ |
+| 8 | Streaming quotes (websocket) for intraday | ⏳ |
+| 9 | Intraday parameter sweep and walk-forward | ⏳ |
 
 How to use this file:
-- Open Claude Code in the `tradebot/` directory.
-- Paste the **Master prompt** first, then one task prompt at a time.
-- Review each diff before accepting it.
+- Open Claude Code in `tradebot/`.
+- Paste the **Master prompt**, then one task at a time.
+- Review every diff.
 
 ---
 
 ## Master prompt (paste first)
 
 ```text
-You are working on `tradebot`, a Go swing-trading bot in this directory. Read docs/ARCHITECTURE.md, docs/STRATEGY.md and docs/RUNBOOK.md before changing anything.
+You are working on `tradebot`, a Go trading bot in this directory with two modes: swing (`tradebot run`) and intraday opening-range breakout (`tradebot day`). Read docs/ARCHITECTURE.md, docs/STRATEGY.md, docs/INTRADAY.md and docs/RUNBOOK.md before changing anything.
 
 Non-negotiable invariants. Never weaken these, and add tests when you touch related code:
-1. The deterministic strategy decides trades. Claude (internal/llm) may only approve, reduce or veto NEW entries; Verdict.Multiplier() must stay clamped to [0,1].
-2. internal/risk is the final gate for every order in backtest, paper and live. No code path may submit an order that did not pass risk.Check.
-3. Backtest and live use the same strategy/portfolio/risk functions. Decisions only see data.Until(decisionDate). TestNoLookAhead must keep passing.
-4. Robinhood orders go only through the PreToolUse guard (internal/hook). Unknown tools are denied. No options, shorts, margin, dollar-amount or market orders.
-5. Fail closed on any error. No secrets in code, logs, prompts or git.
+1. Deterministic code decides trades. Claude (internal/llm) may only approve, reduce or veto; every multiplier stays clamped to [0,1]. Claude is never called inside the intraday price loop.
+2. internal/risk (plus the intraday engine's own limits) gates every order in backtest, paper and live. No code path may submit an order that skipped them.
+3. Backtests and live trading share the same strategy/engine code and only see data available at decision time. TestNoLookAhead and TestBacktestDeterministicAndNoLookAhead must keep passing.
+4. Robinhood orders pass the guard (internal/hook), whether through Claude Code or in-process in the native broker. Unknown tools are denied. No options, shorts, margin, dollar-amount or market orders. The native broker cancels only orders it placed.
+5. Intraday positions are always flat by the close; the intraday session never sells positions it did not open.
+6. Fail closed on any error. No secrets in code, logs, prompts or git.
 
 Workflow for every task:
-- Make a short plan and show it to me.
-- Implement in small commits, with `gofmt`, `go vet ./...` and `go test ./...` passing.
+- Show a short plan first.
+- Implement in small commits, with `gofmt`, `go vet ./...` and `go test -race ./...` passing.
 - Update the docs you affect.
 - Report exactly what you verified and what you could not.
 ```
 
 ---
 
-## Task 1: Real-data backtest and robustness report
+## Task 1: Real-data backtests and robustness report (both modes)
 
 ```text
-Load my environment (.env) and run: make fetch (start 2012-01-01, set defensive: BIL for the long history), make backtest, make sweep (--split 2020-01-01).
-Then:
-- Run the same backtest with an ETF-only universe (SPY QQQ IWM DIA the XL* sector ETFs SMH GLD TLT) to measure survivorship bias.
-- Run each sleeve alone (momentum weight 1.0 / mean-reversion weight 1.0) and the combination.
-- Run with slippage_bps 5, 15 and 30 to test cost sensitivity.
-Write docs/BACKTEST_REPORT.md with:
-- the tables;
-- the out-of-sample vs in-sample comparison;
-- the median and worst out-of-sample Sharpe across the sweep;
-- a recommendation for parameters from a broad stable plateau (not the best row).
-Do NOT change defaults based on out-of-sample results; only recommend. Flag anything that looks too good to be true.
+Load .env. Swing mode: make fetch (start 2012-01-01, defensive: BIL), make backtest, make sweep (--split 2020-01-01), plus an ETF-only universe run and slippage 5/15/30 bps.
+Intraday: make fetch-intraday (start 2023-01-01) then make backtest-intraday with slippage_bps 3, 5 and 10; also run it separately for each calendar half-year.
+Write docs/BACKTEST_REPORT.md with the tables, in-sample vs out-of-sample, cost sensitivity, and a recommendation from broad stable parameter regions. Do not change defaults based on out-of-sample results. Flag anything that looks too good to be true (e.g. intraday Sharpe > 3 usually means a fill-model problem).
 ```
 
-## Task 2: Robinhood MCP discovery and guard hardening
+## Task 2: Map the real Robinhood tools
 
 ```text
-Goal: make the Robinhood execution guard match the REAL robinhood-trading MCP tools.
-1. Start `claude` interactively in deploy/robinhood-executor, list all robinhood-trading tools with exact names and full JSON input schemas. Do NOT call any tool that places, modifies or cancels orders. Save them to docs/robinhood_tools.json (no account data).
-2. Update configs/config.yaml → robinhood.order_tool_keywords / read_tool_keywords / deny_keywords / fields / forbidden_input_keys to match exactly. Prefer exact tool names over keywords if the schema allows (add an `order_tools` / `read_tools` exact-name allowlist to config and hook.Evaluate, keeping keywords as a fallback that still denies unknown tools).
-3. Add table tests in internal/hook using the real schemas: the approved order passes; wrong qty, price, side or symbol, market orders, option fields and every write tool other than the order tool are denied.
-4. If the order tool supports time_in_force / extended hours, require DAY and regular hours in the guard.
-5. Update the executor prompt in internal/broker/robinhood.go to name the exact tool and argument names.
-6. Add a read-only `tradebot rh-orders` command that asks the executor for today's order statuses (JSON), and have the runner reconcile it at the start of the next run: log any order whose status differs from what we submitted.
-```
-
-## Task 3: Native MCP client (removes the LLM from execution)
-
-```text
-Investigate whether Robinhood's Agentic Trading MCP OAuth flow works with a custom (non-Claude-Code) client. If it does, implement broker.RobinhoodNative using the official Go MCP SDK (github.com/modelcontextprotocol/go-sdk):
-- one-time interactive OAuth login command (`tradebot rh-login`) storing refresh tokens encrypted at rest (0600, key from env);
-- Account() and Submit() calling the MCP tools directly with the exact schemas from Task 2, running the same intent checks as internal/hook in-process before each call;
-- idempotency (never blind-retry a submit; query order status first);
-- tests with an in-memory fake MCP server.
-Keep the Claude Code executor as a fallback selectable by config. If OAuth for custom clients is not supported, write up the findings and stop.
+Run `./bin/tradebot rh-tools` (after `rh-login`). Using state/robinhood-native/tools.json:
+1. Fill robinhood.native.{account_tool,positions_tool,place_order_tool,order_status_tool,cancel_order_tool}, order_args, fixed_args (limit + day time-in-force), numbers_as_strings and result_keys in configs/config.yaml.
+2. Align robinhood.order_tool_keywords / read_tool_keywords / deny_keywords / fields with the real names, so the guard classifies every real tool correctly.
+3. Add tests in internal/broker and internal/hook that use recorded (anonymized) example responses and the real schemas: account parsing, order args, status parsing, and denial of every write tool other than place/cancel.
+4. Run `./bin/tradebot doctor` until every check passes. Then do a guard drill: swing `run --broker robinhood-native` with risk.max_orders_per_run: 1 and the smallest possible position, and confirm the order in the Robinhood app.
+Never place orders outside that single drill, and never call cancel/transfer tools manually.
 ```
 
 ## Task 4: Deterministic earnings blackout
 
 ```text
-Add an earnings-calendar data source (evaluate Alpaca corporate actions/calendar availability, or a free/cheap provider; document limits and cost). Add strategy config `earnings_blackout_days` (default 2):
-- no NEW mean-reversion entries if earnings fall within N trading days;
-- momentum entries within N days get size ×0.5.
-It must be point-in-time in backtests (use announcement dates known at decision time, or disable in backtest with a clear note). Add tests. Keep Claude's news review as a second layer.
+Add an earnings-calendar source (evaluate Alpaca corporate actions and a free/cheap provider; document limits and cost). Add `earnings_blackout_days` (default 2) for swing mean-reversion entries (skip) and momentum entries (×0.5).
+For intraday: skip symbols whose earnings release is scheduled DURING today's session; pre-market releases are fine, since those are the catalysts.
+It must be point-in-time in backtests, or disabled there with a clear note. Add tests.
 ```
 
-## Task 5: Survivorship-bias-free universe (optional, for research)
+## Task 5: Survivorship-free universe (optional)
 
 ```text
-Add support for a point-in-time universe file (CSV: date,symbol for membership changes, e.g. S&P 100 history). The backtest only allows symbols that were members at the decision date; live uses the latest membership. Add a data-loading test and re-run Task 1's stock-universe backtest to quantify the bias.
+Support a point-in-time universe file (CSV date,symbol membership changes). Backtests only trade names that were members at the decision date. Quantify the bias against Task 1.
 ```
 
-## Task 6: Weekly Claude review and performance tracking
+## Task 6: Weekly report and Claude critique
 
 ```text
-Add `tradebot report --broker <name> [--weeks 1]`:
-- Rebuild the live equity curve and closed trades from journal.jsonl and account snapshots.
-- Compute the same metrics as the backtest (Sharpe, drawdown, win rate, slippage vs limit and vs next open).
-- For every Claude veto/reduction, compute the hypothetical outcome of the unvetoed trade over its typical holding period, to measure whether the overlay helps.
-- Send a compact summary to Claude (same SDK patterns as internal/llm: structured output, cached system prompt, refusal fallbacks, fail closed) and ask for a critique and anomalies. It is advisory only: it must not change config or state.
-Write the report to state/<broker>/reports/YYYY-MM-DD.md and post a summary to the webhook.
+Add `tradebot report --broker <name> [--weeks 1]` for both modes:
+- Rebuild the equity curve and trades from the journals.
+- Compare against the backtest's expectations (win rate, avg R, slippage vs limit).
+- For each Claude veto/reduction, compute what the trade would have done.
+- Ask Claude for an advisory critique using the patterns in internal/llm (structured output, cached system prompt, refusal fallback, fail closed). The critique never changes config or state.
+- Write the report to state/<dir>/reports/YYYY-MM-DD.md and post a summary to the webhook.
 ```
 
-## Task 7: Pre-live hardening checklist
+## Task 8: Streaming quotes for intraday
 
 ```text
-Audit the codebase for live readiness and fix the gaps:
-- context timeouts on every network call;
-- retries with backoff only for idempotent reads;
-- clean handling of partial fills and orders still open from yesterday (cancel via guard-approved intents only if needed);
-- a file lock so two `tradebot run` processes can never overlap;
-- structured logging;
-- `tradebot doctor`, which checks keys, the data feed, the calendar, Claude Code auth, the MCP connection (read-only) and clock/timezone.
-Add tests where possible. Then re-run `go test -race ./...` and the synthetic smoke test.
+Add an Alpaca market-data websocket feed (trades for the watchlist, feed from config: iex or sip) implementing intraday.Feed.LatestQuotes from an in-memory cache.
+- Reconnect with backoff.
+- Detect staleness: no update within max_quote_age_seconds means stale.
+- Fall back to REST polling if the stream is down.
+Keep the engine unchanged (OnPrice). Add tests with a fake websocket server. Measure and log quote-to-order latency in the journal.
+```
+
+## Task 9: Intraday parameter sweep and walk-forward
+
+```text
+Add `tradebot sweep-intraday`: a parallel grid over opening_range_minutes {5,15,30}, stop_atr_fraction {0.05,0.10,0.20}, min_rvol {1,1.5,2}, top_n_in_play {5,10,20}, and take_profit_r {0,3}.
+- Rank on an in-sample window and report out-of-sample, like backtest.Sweep.
+- Reuse loaded minute data across runs (load once, share read-only).
+- Print the median and worst out-of-sample results.
+```
+
+## Remaining hardening (from Task 7)
+
+```text
+Replace fmt-based logging with log/slog (JSON to state/<dir>/tradebot.log, text to stdout). Keep journal.jsonl as the audit record. Include order IDs and latencies in every order/fill log line.
 ```

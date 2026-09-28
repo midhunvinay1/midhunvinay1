@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/midhunvinay1/tradebot/internal/alpaca"
 	"github.com/midhunvinay1/tradebot/internal/portfolio"
@@ -44,6 +45,47 @@ type Broker interface {
 	Name() string
 	Account(ctx context.Context) (Account, error)
 	Submit(ctx context.Context, orders []portfolio.Order) ([]Result, error)
+}
+
+// OrderStatus is the fill state of one submitted order.
+type OrderStatus struct {
+	Status      string  `json:"status"` // new | partially_filled | filled | canceled | expired | rejected
+	FilledQty   float64 `json:"filled_qty"`
+	FilledPrice float64 `json:"filled_price"`
+}
+
+// Done reports whether the order can no longer fill further.
+func (s OrderStatus) Done() bool {
+	switch s.Status {
+	case "filled", "canceled", "expired", "rejected", "done_for_day", "replaced":
+		return true
+	}
+	return false
+}
+
+// Tracker is a broker that can report and cancel individual orders. The
+// intraday mode requires it.
+type Tracker interface {
+	Broker
+	OrderStatus(ctx context.Context, brokerOrderID string) (OrderStatus, error)
+	Cancel(ctx context.Context, brokerOrderID string) error
+}
+
+// NormalizeStatus maps broker-specific order states to OrderStatus.Status.
+func NormalizeStatus(s string) string {
+	switch s = strings.ToLower(strings.TrimSpace(s)); s {
+	case "filled", "executed", "complete", "completed":
+		return "filled"
+	case "partially_filled", "partial", "partially filled":
+		return "partially_filled"
+	case "canceled", "cancelled", "done_for_day":
+		return "canceled"
+	case "expired":
+		return "expired"
+	case "rejected", "failed", "denied":
+		return "rejected"
+	}
+	return "new"
 }
 
 // ---- Dry run ----
@@ -87,6 +129,16 @@ func (a AlpacaPaper) Account(ctx context.Context) (Account, error) {
 	}
 	return out, nil
 }
+
+func (a AlpacaPaper) OrderStatus(ctx context.Context, id string) (OrderStatus, error) {
+	s, err := a.C.GetOrder(ctx, id)
+	if err != nil {
+		return OrderStatus{}, err
+	}
+	return OrderStatus{Status: NormalizeStatus(s.Status), FilledQty: s.FilledQty, FilledPrice: s.FilledPrice}, nil
+}
+
+func (a AlpacaPaper) Cancel(ctx context.Context, id string) error { return a.C.CancelOrder(ctx, id) }
 
 func (a AlpacaPaper) Submit(ctx context.Context, orders []portfolio.Order) ([]Result, error) {
 	var out []Result

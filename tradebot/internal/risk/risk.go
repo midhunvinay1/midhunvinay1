@@ -56,6 +56,9 @@ func New(cfg *config.Config, st *State, haltFile string) *Engine {
 	for _, s := range cfg.Universe {
 		e.allowed[s] = true
 	}
+	for _, s := range cfg.IntradaySymbols() {
+		e.allowed[s] = true
+	}
 	if cfg.Defensive != "" {
 		e.allowed[cfg.Defensive] = true
 	}

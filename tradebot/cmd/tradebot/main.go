@@ -25,8 +25,10 @@ import (
 	"github.com/midhunvinay1/tradebot/internal/config"
 	"github.com/midhunvinay1/tradebot/internal/data"
 	"github.com/midhunvinay1/tradebot/internal/hook"
+	"github.com/midhunvinay1/tradebot/internal/intraday"
 	"github.com/midhunvinay1/tradebot/internal/journal"
 	"github.com/midhunvinay1/tradebot/internal/llm"
+	"github.com/midhunvinay1/tradebot/internal/lock"
 	"github.com/midhunvinay1/tradebot/internal/market"
 	"github.com/midhunvinay1/tradebot/internal/notify"
 	"github.com/midhunvinay1/tradebot/internal/risk"
@@ -45,6 +47,17 @@ Usage:
   tradebot resume   --config C                                          release the kill switch
   tradebot status   --config C [--broker ...]
   tradebot hook pretooluse                                              Claude Code PreToolUse guard (reads stdin)
+
+Intraday (opening-range breakout, flat by the close):
+  tradebot fetch-intraday    --config C --start 2024-01-01 [--out data/minute]
+  tradebot synth-intraday    --config C [--out data/minute-synth] [--days 250]
+  tradebot backtest-intraday --config C --data DIR [--start D] [--end D] [--out DIR]
+  tradebot day               --config C --broker dry-run|alpaca-paper|robinhood-native [--force]
+
+Robinhood native MCP (no LLM in the order path):
+  tradebot rh-login  --config C        one-time browser OAuth login
+  tradebot rh-tools  --config C        list the MCP tools and their input schemas (read-only)
+  tradebot doctor    --config C        check keys, data, calendar, Claude Code and Robinhood access
 `
 
 func main() {
@@ -70,6 +83,18 @@ func main() {
 		err = cmdKill(os.Args[1], os.Args[2:])
 	case "hook":
 		os.Exit(cmdHook(os.Args[2:], os.Stdin, os.Stderr))
+	case "fetch-intraday":
+		err = cmdFetchIntraday(ctx, os.Args[2:])
+	case "synth-intraday":
+		err = cmdSynthIntraday(os.Args[2:])
+	case "backtest-intraday":
+		err = cmdBacktestIntraday(ctx, os.Args[2:])
+	case "day":
+		err = cmdDay(ctx, os.Args[2:])
+	case "rh-login", "rh-tools":
+		err = cmdRobinhoodNative(ctx, os.Args[1], os.Args[2:])
+	case "doctor":
+		err = cmdDoctor(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	default:
@@ -291,7 +316,7 @@ func cmdSweep(ctx context.Context, args []string) error {
 
 func cmdRun(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
-	brokerName := fs.String("broker", "dry-run", "dry-run | alpaca-paper | robinhood")
+	brokerName := fs.String("broker", "dry-run", "dry-run | alpaca-paper | robinhood | robinhood-native")
 	dataSrc := fs.String("data", "alpaca", "alpaca, or a CSV directory")
 	force := fs.Bool("force", false, "run even if already run today or the market is closed")
 	cfg, cfgPath, err := loadConfig(fs, args)
@@ -299,6 +324,11 @@ func cmdRun(ctx context.Context, args []string) error {
 		return err
 	}
 	stateDir := filepath.Join(cfg.StateDir, *brokerName)
+	release, err := lock.Acquire(stateDir)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	var ac *alpaca.Client
 	needAlpaca := *dataSrc == "alpaca" || *brokerName == "alpaca-paper"
@@ -320,6 +350,10 @@ func cmdRun(ctx context.Context, args []string) error {
 		b = broker.AlpacaPaper{C: ac}
 	case "robinhood":
 		b = &broker.Robinhood{Cfg: cfg.Robinhood, StateDir: stateDir, ConfigPath: cfgPath}
+	case "robinhood-native":
+		n := nativeBroker(cfg, false)
+		defer n.Close()
+		b = n
 	default:
 		return fmt.Errorf("unknown broker %q", *brokerName)
 	}
@@ -351,27 +385,25 @@ func cmdKill(which string, args []string) error {
 	if err != nil {
 		return err
 	}
-	brokers := []string{"dry-run", "alpaca-paper", "robinhood"}
+	brokers := []string{"dry-run", "alpaca-paper", "robinhood", "robinhood-native",
+		"intraday-dry-run", "intraday-alpaca-paper", "intraday-robinhood-native"}
 	if *brokerName != "" {
 		brokers = []string{*brokerName}
 	}
 	for _, bn := range brokers {
 		dir := filepath.Join(cfg.StateDir, bn)
+		if strings.HasPrefix(bn, "intraday-") {
+			if err := killIntraday(cfg, which, dir, bn, *reason); err != nil {
+				return err
+			}
+			continue
+		}
 		st, err := runner.LoadState(dir)
 		if err != nil {
 			return err
 		}
 		rk := risk.New(cfg, st.Risk, risk.HaltFilePath(dir))
-		switch which {
-		case "halt":
-			rk.Halt(*reason + " @ " + time.Now().Format(time.RFC3339))
-			fmt.Printf("%s: HALTED\n", bn)
-		case "resume":
-			rk.St.Halted, rk.St.HaltReason = false, ""
-			_ = os.Remove(risk.HaltFilePath(dir))
-			fmt.Printf("%s: resumed (peak equity reset to current on next run)\n", bn)
-			rk.St.PeakEquity = 0
-		case "status":
+		if !applyKill(which, rk, dir, bn, *reason) {
 			h, why := rk.Halted()
 			fmt.Printf("%s: halted=%v %s | peak equity %.2f | last run %s | momentum %d | mean-reversion %d\n", bn, h, why,
 				st.Risk.PeakEquity, st.LastRunDate.Format("2006-01-02"), len(st.Strategy.Momentum), len(st.Strategy.MeanRev))
@@ -383,6 +415,39 @@ func cmdKill(which string, args []string) error {
 		}
 	}
 	return nil
+}
+
+func killIntraday(cfg *config.Config, which, dir, bn, reason string) error {
+	st, err := intraday.LoadLiveState(dir)
+	if err != nil {
+		return err
+	}
+	rk := risk.New(cfg, st.Risk, risk.HaltFilePath(dir))
+	if !applyKill(which, rk, dir, bn, reason) {
+		h, why := rk.Halted()
+		fmt.Printf("%s: halted=%v %s | peak equity %.2f | last session %s | open at last close %v\n", bn, h, why,
+			st.Risk.PeakEquity, st.LastRunDate.Format("2006-01-02"), st.OpenAtClose)
+		return nil
+	}
+	st.Risk = rk.St
+	return intraday.SaveLiveState(dir, st)
+}
+
+// applyKill performs halt/resume; it returns false for status (nothing to save).
+func applyKill(which string, rk *risk.Engine, dir, bn, reason string) bool {
+	switch which {
+	case "halt":
+		rk.Halt(reason + " @ " + time.Now().Format(time.RFC3339))
+		fmt.Printf("%s: HALTED\n", bn)
+	case "resume":
+		rk.St.Halted, rk.St.HaltReason = false, ""
+		_ = os.Remove(risk.HaltFilePath(dir))
+		rk.St.PeakEquity = 0
+		fmt.Printf("%s: resumed (peak equity resets to current equity on the next run)\n", bn)
+	default:
+		return false
+	}
+	return true
 }
 
 // cmdHook implements the Claude Code PreToolUse hook. Exit 0 allows the

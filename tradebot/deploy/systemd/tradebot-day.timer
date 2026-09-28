@@ -1,0 +1,9 @@
+[Unit]
+Description=Start the tradebot intraday session on weekdays at 09:05 New York time
+
+[Timer]
+OnCalendar=Mon..Fri 09:05 America/New_York
+Persistent=false
+
+[Install]
+WantedBy=timers.target

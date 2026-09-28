@@ -1,0 +1,17 @@
+[Unit]
+Description=tradebot intraday session (opening-range breakout, flat by the close)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tradebot
+WorkingDirectory=/opt/tradebot
+EnvironmentFile=/opt/tradebot/.env
+# Switch to --broker robinhood-native only after the paper-trading go/no-go (docs/RUNBOOK.md).
+ExecStart=/opt/tradebot/bin/tradebot day --config /opt/tradebot/configs/config.yaml --broker alpaca-paper
+TimeoutStartSec=8h
+# If the process dies mid-session, restart it: positions checkpointed after
+# every fill are flattened as leftovers, and a completed day is never rerun.
+Restart=on-failure
+RestartSec=30

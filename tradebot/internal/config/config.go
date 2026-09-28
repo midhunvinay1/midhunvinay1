@@ -20,6 +20,7 @@ type Config struct {
 	Alpaca    AlpacaConfig    `yaml:"alpaca"`
 	Robinhood RobinhoodConfig `yaml:"robinhood"`
 	Notify    NotifyConfig    `yaml:"notify"`
+	Intraday  IntradayConfig  `yaml:"intraday"`
 	StateDir  string          `yaml:"state_dir"`
 }
 
@@ -125,6 +126,69 @@ type RobinhoodConfig struct {
 	ForbiddenInputKeys []string            `yaml:"forbidden_input_keys"`
 	PriceToleranceBps  float64             `yaml:"price_tolerance_bps"`
 	IntentTTLMinutes   int                 `yaml:"intent_ttl_minutes"`
+	Native             NativeMCPConfig     `yaml:"native"`
+}
+
+// NativeMCPConfig configures the direct (no-LLM) MCP client for Robinhood.
+// Tool names and argument keys must be filled in from `tradebot rh-tools`.
+type NativeMCPConfig struct {
+	Enabled         bool                `yaml:"enabled"`
+	ServerURL       string              `yaml:"server_url"`
+	TokenFile       string              `yaml:"token_file"` // relative paths are inside the broker state dir
+	CallbackPort    int                 `yaml:"callback_port"`
+	ClientName      string              `yaml:"client_name"`
+	AccountTool     string              `yaml:"account_tool"`
+	PositionsTool   string              `yaml:"positions_tool"`
+	PlaceOrderTool  string              `yaml:"place_order_tool"`
+	OrderStatusTool string              `yaml:"order_status_tool"`
+	CancelOrderTool string              `yaml:"cancel_order_tool"`
+	OrderArgs       map[string]string   `yaml:"order_args"`  // logical field -> tool argument key
+	FixedArgs       map[string]any      `yaml:"fixed_args"`  // extra constant arguments, e.g. type: limit
+	ResultKeys      map[string][]string `yaml:"result_keys"` // logical field -> candidate keys in tool results
+	CallTimeoutSec  int                 `yaml:"call_timeout_sec"`
+	// NumbersAsStrings sends quantity and price as strings ("10", "101.25").
+	NumbersAsStrings bool `yaml:"numbers_as_strings"`
+}
+
+// IntradayConfig configures the opening-range-breakout day-trading mode.
+type IntradayConfig struct {
+	Universe            []string `yaml:"universe"` // empty = top-level universe
+	OpeningRangeMinutes int      `yaml:"opening_range_minutes"`
+	RVOLLookbackDays    int      `yaml:"rvol_lookback_days"`
+	MinRVOL             float64  `yaml:"min_rvol"`
+	TopNInPlay          int      `yaml:"top_n_in_play"`
+	MinATRDollars       float64  `yaml:"min_atr_dollars"`
+	ATRDays             int      `yaml:"atr_days"`
+	MinPrice            float64  `yaml:"min_price"`
+	StopATRFraction     float64  `yaml:"stop_atr_fraction"`
+	BreakevenAtR        float64  `yaml:"breakeven_at_r"` // 0 = off
+	TakeProfitR         float64  `yaml:"take_profit_r"`  // 0 = hold to the close
+	RiskPerTrade        float64  `yaml:"risk_per_trade"` // fraction of equity lost if the stop is hit
+	MaxPositions        int      `yaml:"max_positions"`
+	MaxPositionWeight   float64  `yaml:"max_position_weight"`
+	MaxTradesPerDay     int      `yaml:"max_trades_per_day"`
+	NoEntriesAfter      string   `yaml:"no_entries_after"` // HH:MM New York
+	FlattenAt           string   `yaml:"flatten_at"`       // HH:MM New York
+	DailyLossLimit      float64  `yaml:"daily_loss_limit"`
+	DayTradeLimit5D     int      `yaml:"day_trade_limit_5d"` // 0 = unlimited (PDT rule removed; set 3 if your broker still enforces it)
+	AccountType         string   `yaml:"account_type"`       // cash (buys limited to settled cash) | margin (still no leverage)
+	EntryLimitBps       float64  `yaml:"entry_limit_bps"`
+	ExitLimitBps        float64  `yaml:"exit_limit_bps"`
+	SlippageBps         float64  `yaml:"slippage_bps"`
+	PollSeconds         float64  `yaml:"poll_seconds"`
+	MaxQuoteAgeSeconds  float64  `yaml:"max_quote_age_seconds"`
+	OrderTimeoutSeconds float64  `yaml:"order_timeout_seconds"`
+	PremarketReview     bool     `yaml:"premarket_review"`
+	NewsLookbackHours   int      `yaml:"news_lookback_hours"`
+	AllowSlowExecutor   bool     `yaml:"allow_slow_executor"` // allow the Claude Code executor intraday (10-30 s per order)
+}
+
+// IntradaySymbols returns the intraday universe (defaults to the main universe).
+func (c *Config) IntradaySymbols() []string {
+	if len(c.Intraday.Universe) > 0 {
+		return c.Intraday.Universe
+	}
+	return c.Universe
 }
 
 type NotifyConfig struct {
@@ -186,6 +250,24 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("risk.hard_drawdown must be in (0,1)")
 	case c.LLM.OnError != "skip" && c.LLM.OnError != "allow":
 		return fmt.Errorf("llm.on_error must be skip or allow")
+	}
+	in := c.Intraday
+	switch {
+	case in.AccountType != "cash" && in.AccountType != "margin":
+		return fmt.Errorf("intraday.account_type must be cash or margin")
+	case in.RiskPerTrade <= 0 || in.RiskPerTrade > 0.03:
+		return fmt.Errorf("intraday.risk_per_trade must be in (0, 0.03]")
+	case in.MaxPositionWeight <= 0 || in.MaxPositionWeight*float64(in.MaxPositions) > 1.0001:
+		return fmt.Errorf("intraday.max_positions * max_position_weight must be <= 1 (no leverage)")
+	case in.PollSeconds < 1:
+		return fmt.Errorf("intraday.poll_seconds must be >= 1 (data API rate limits)")
+	case in.OpeningRangeMinutes < 1 || in.StopATRFraction <= 0:
+		return fmt.Errorf("intraday.opening_range_minutes and stop_atr_fraction must be positive")
+	}
+	for _, hm := range []string{in.NoEntriesAfter, in.FlattenAt} {
+		if _, err := ParseClock(hm); err != nil {
+			return err
+		}
 	}
 	for _, lb := range s.Momentum.Lookbacks {
 		if lb <= s.Momentum.Skip {
@@ -260,8 +342,42 @@ func Defaults() *Config {
 				"notional", "dollar_amount", "amount_in_dollars", "stop_price", "trail_amount"},
 			PriceToleranceBps: 50,
 			IntentTTLMinutes:  30,
+			Native: NativeMCPConfig{
+				ServerURL: "https://agent.robinhood.com/mcp/trading", TokenFile: "oauth_token.json", CallbackPort: 3142,
+				ClientName: "tradebot", CallTimeoutSec: 15,
+				OrderArgs: map[string]string{"symbol": "symbol", "side": "side", "quantity": "quantity", "limit_price": "limit_price"},
+				FixedArgs: map[string]any{"type": "limit", "time_in_force": "gfd"},
+				ResultKeys: map[string][]string{
+					"equity":     {"equity", "total_equity", "portfolio_value", "total_value"},
+					"cash":       {"cash", "cash_available", "buying_power", "cash_balance"},
+					"positions":  {"positions", "holdings"},
+					"symbol":     {"symbol", "ticker"},
+					"quantity":   {"quantity", "qty", "shares"},
+					"avg_price":  {"average_price", "average_buy_price", "avg_price", "cost_basis_per_share"},
+					"order_id":   {"order_id", "id"},
+					"status":     {"status", "state"},
+					"filled":     {"filled_quantity", "cumulative_quantity", "filled_qty"},
+					"fill_price": {"average_fill_price", "average_price", "filled_avg_price", "price"},
+				},
+			},
 		},
-		Notify:   NotifyConfig{WebhookURLEnv: "TRADEBOT_WEBHOOK_URL"},
+		Notify: NotifyConfig{WebhookURLEnv: "TRADEBOT_WEBHOOK_URL"},
+		Intraday: IntradayConfig{
+			OpeningRangeMinutes: 5, RVOLLookbackDays: 14, MinRVOL: 1.0, TopNInPlay: 10, MinATRDollars: 0.5, ATRDays: 14,
+			MinPrice: 5, StopATRFraction: 0.10, RiskPerTrade: 0.01, MaxPositions: 4, MaxPositionWeight: 0.25,
+			MaxTradesPerDay: 8, NoEntriesAfter: "15:00", FlattenAt: "15:55", DailyLossLimit: 0.02, AccountType: "cash",
+			EntryLimitBps: 10, ExitLimitBps: 30, SlippageBps: 3, PollSeconds: 2, MaxQuoteAgeSeconds: 10,
+			OrderTimeoutSeconds: 20, PremarketReview: true, NewsLookbackHours: 18,
+		},
 		StateDir: "state",
 	}
+}
+
+// ParseClock parses "HH:MM" into minutes after midnight.
+func ParseClock(hm string) (int, error) {
+	var h, m int
+	if _, err := fmt.Sscanf(hm, "%d:%d", &h, &m); err != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+		return 0, fmt.Errorf("invalid time %q (want HH:MM)", hm)
+	}
+	return h*60 + m, nil
 }

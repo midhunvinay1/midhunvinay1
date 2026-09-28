@@ -1,6 +1,6 @@
 # tradebot: Architecture
 
-A medium-risk swing-trading bot for a Robinhood agentic account. A **deterministic, evidence-based strategy** decides the trades. **Claude** reviews each new entry and can only shrink or veto it. A **hard risk engine** has the final word. The same code runs in backtest, paper trading (Alpaca) and live trading (Robinhood).
+A trading bot for a Robinhood agentic account with two modes: **swing** (`tradebot run`, daily, this document's main subject) and **intraday** (`tradebot day`, opening-range breakout, flat by the close; see [INTRADAY.md](INTRADAY.md)). A **deterministic, evidence-based strategy** decides the trades. **Claude** reviews each new entry and can only shrink or veto it. A **hard risk engine** has the final word. The same code runs in backtest, paper trading (Alpaca) and live trading (Robinhood).
 
 > The strategy and its evidence are in [STRATEGY.md](STRATEGY.md). How to run everything is in [RUNBOOK.md](RUNBOOK.md).
 
@@ -103,8 +103,10 @@ sequenceDiagram
 | `internal/risk` | Final gate: universe/deny list, limit-price sanity, position/gross/cash limits, no shorting, turnover, max orders, stale data, daily-loss and drawdown breakers, kill switch | Pure and deterministic; the file-based `HALT` switch works across processes |
 | `internal/llm` | Claude entry reviewer | Structured output schema, cached system prompt, server-side refusal fallback, on-disk decision cache, untrusted news fenced and escaped |
 | `internal/backtest` | Event-driven daily simulation, metrics, yearly table, parallel parameter sweep with in-sample/out-of-sample split | Limit orders fill at the next open with slippage, or at the limit if touched, otherwise they expire |
-| `internal/alpaca` | Minimal REST client: bars, snapshots, news, calendar, paper account/orders | Refuses non-paper trading URLs |
-| `internal/broker` | `DryRun`, `AlpacaPaper`, `Robinhood` | Robinhood uses Claude Code headless as the MCP client |
+| `internal/alpaca` | Minimal REST client: daily/minute bars, latest trades, news, calendar, paper account/orders/status/cancel | Refuses non-paper trading URLs; retries reads (never order submissions) on 429/5xx |
+| `internal/broker` | `DryRun`, `PaperSim`, `AlpacaPaper`, `Robinhood` (Claude Code executor), `RobinhoodNative` (direct MCP) | Order tracking/cancel (`Tracker`) for intraday; the native broker cancels only its own orders |
+| `internal/intraday` | ORB engine (pure state machine), minute-bar backtester, live session loop | Same engine for backtest and live; Claude only before the open |
+| `internal/lock` | Single-instance `flock` per state directory | Two overlapping runs can never double orders |
 | `internal/hook` | Claude Code **PreToolUse guard** | Allows read-only tools and order calls matching a risk-approved intent (single use, 30-min expiry); denies everything else |
 | `internal/runner` | One live/paper cycle, persistence, summary | Runs once per day unless `--force` |
 | `internal/journal`, `internal/notify` | JSONL audit log; Slack-compatible webhook | none |
@@ -125,7 +127,19 @@ This bot uses **Claude Code in headless mode as the MCP client** (`claude -p ...
 3. After the session, the runner **cross-checks** the executor's self-reported results against the guard's claim log. An order Claude claims it placed, but which the guard never allowed, is marked FAILED. A test run with a deliberately faulty executor confirmed this.
 4. All intents are revoked when the run ends.
 
-**Option A (future):** once Robinhood's OAuth is confirmed to work for non-interactive custom clients, replace Claude Code with a native Go MCP client (`modelcontextprotocol/go-sdk`). That removes the LLM from execution entirely. The `Broker` interface makes this a drop-in change. See the completion prompt.
+### 5.1 Native MCP client (implemented: `--broker robinhood-native`)
+
+`internal/broker/rhnative.go` connects to the same Robinhood MCP server directly with the official Go MCP SDK. **There is no LLM in the order path.**
+- **Login:**
+  - OAuth is handled by the SDK: server discovery, dynamic client registration and PKCE.
+  - `tradebot rh-login` runs the browser consent once. The refresh token is stored with 0600 permissions and refreshed automatically.
+  - Headless runs never open a browser; they fail with instructions instead.
+- **Tool mapping:** exact tool names and argument keys come from `tradebot rh-tools` and live in `robinhood.native` in the config. `tradebot doctor` checks that every configured tool exists.
+- **Guard:** every order still passes the same guard (`hook.Evaluate`) in-process, so a config mistake cannot become a market order, an options order or a wrong size.
+- **Cancels:** the broker only cancels orders that it placed itself in the same process.
+- **Tests:** an in-memory MCP server (tool mapping, result parsing, the guard, cancel scoping) and a fake OAuth authorization server (full browser flow, token reuse, refresh and persistence).
+
+This is **required for intraday trading**, because a Claude Code session takes 10–30 s per order. For swing trading either path works. The Claude Code executor stays available as a fallback.
 
 ## 6. Defense in depth (live money)
 
@@ -188,6 +202,15 @@ state/<broker>/
 ├── llm_cache/          Claude verdicts keyed by hash(model, prompt version, input)
 ├── intents/            Robinhood only: current.json + used/ claim markers
 └── HALT                present = kill switch engaged (created by `tradebot halt` or the drawdown breaker)
+
+state/intraday-<broker>/
+├── intraday.json       day-trade counts, last session, risk state, positions left open at the last close
+├── journal.jsonl       pre-market verdicts, stocks in play, every order/fill, session summary
+└── HALT, lock, llm_cache/
+
+state/robinhood-native/
+├── oauth_token.json    OAuth client registration and refresh token (0600)
+└── tools.json          last `tradebot rh-tools` output
 ```
 
 Each broker keeps separate state (`state/dry-run`, `state/alpaca-paper`, `state/robinhood`), so paper and live never interfere.
@@ -195,6 +218,7 @@ Each broker keeps separate state (`state/dry-run`, `state/alpaca-paper`, `state/
 ## 10. Known limitations
 
 - **Survivorship bias:** the default universe is today's large caps, which inflates backtests. See STRATEGY.md §6.
-- **The Robinhood MCP tool names and schemas are not public.** The guard's keyword/field mapping must be verified against the real tools before going live (RUNBOOK step 4.3). Unknown tools are denied until then.
-- **Robinhood account data is transcribed by Claude.** The runner checks it for plausibility, and Robinhood's funded ceiling bounds the damage. Option A removes this dependency.
+- **The Robinhood MCP tool names and schemas are not public.** Run `tradebot rh-tools` and map them in `robinhood.native` (and the guard keywords) before going live. Unknown tools are denied until then.
+- **With the Claude Code executor, account data is transcribed by Claude.** The runner checks it for plausibility. The native broker reads it directly.
+- **Intraday data:** free real-time Alpaca quotes are IEX-only and can lag. See INTRADAY.md §3.
 - **No earnings calendar yet:** Claude infers imminent earnings from news. A deterministic blackout is in the completion prompt.

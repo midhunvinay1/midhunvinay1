@@ -6,7 +6,7 @@ Follow the steps in order. Don't skip the paper-trading gate.
 
 | Need | Why | Where |
 |---|---|---|
-| Go 1.24+ | Build the bot | https://go.dev/dl |
+| Go 1.25+ | Build the bot | https://go.dev/dl |
 | Alpaca account (free) | Market data, news, **paper trading** | alpaca.markets → Paper Trading → API keys |
 | Anthropic API key | Claude entry reviews (a few cents per day) | console.anthropic.com |
 | Robinhood account with **Agentic Trading** | Live execution | Robinhood app → Agentic Trading |
@@ -91,6 +91,17 @@ claude            # interactive once: run /mcp → robinhood-trading → Authent
 ```
 Headless runs need Claude Code itself to be authenticated: either log in once interactively, or set `ANTHROPIC_API_KEY` in `.env`.
 
+### 4.2b Native connection (recommended; required for intraday)
+Instead of routing orders through Claude Code, the bot can talk to the same MCP server directly:
+```bash
+./bin/tradebot rh-login     # prints a URL: approve in the browser (redirects to 127.0.0.1:3142)
+./bin/tradebot rh-tools     # lists every tool and its input schema; saves state/robinhood-native/tools.json
+# fill in robinhood.native.* in configs/config.yaml from that output, then:
+./bin/tradebot doctor       # must show ✓ for every robinhood.native.*_tool
+./bin/tradebot run --broker robinhood-native      # swing mode via the native client
+```
+On a headless server, run `rh-login` over an SSH tunnel (`ssh -L 3142:127.0.0.1:3142 server`), or log in locally and copy `state/robinhood-native/oauth_token.json` (keep it at 0600).
+
 ### 4.3 Verify the tool names (required before live)
 In the same interactive session, ask:
 > "List every robinhood-trading MCP tool with its exact name and full input schema. Do not call any tool that places, modifies or cancels orders."
@@ -111,6 +122,14 @@ Check `state/robinhood/journal.jsonl` for `"kind":"guard"` lines: read calls sho
 ### 4.5 Schedule live runs
 Change the systemd `ExecStart` (or your cron line) to `--broker robinhood`, and keep `claude` on the service user's `PATH`.
 
+### 4.6 Intraday mode (short-term)
+See [INTRADAY.md](INTRADAY.md). In short:
+1. `make fetch-intraday backtest-intraday`.
+2. At least 4 weeks of `tradebot day --broker alpaca-paper` via `deploy/systemd/tradebot-day.timer`.
+3. Then `--broker robinhood-native`.
+
+The Claude Code executor is refused intraday because it is too slow.
+
 ## 5. Daily operations
 
 | Situation | Action |
@@ -118,6 +137,8 @@ Change the systemd `ExecStart` (or your cron line) to `--broker robinhood`, and 
 | Normal day | Read the run summary (webhook or log). Robinhood also notifies each fill. |
 | Something looks wrong | `./bin/tradebot halt --reason "investigating"`. This blocks buys; exits still run (set `risk.halt_allows_exits: false` to freeze everything). |
 | Emergency | In the Robinhood app, **disconnect the agent**. This cuts MCP access immediately. |
+| Intraday session misbehaving | `./bin/tradebot halt --broker intraday-robinhood-native`. The running session sees the `HALT` file within one poll and flattens (if `halt_allows_exits`). |
+| Pre-flight check | `./bin/tradebot doctor` (keys, data feed, calendar, Claude Code, Robinhood login and tool names) |
 | Resume after a halt or drawdown breaker | Find the cause first, then `./bin/tradebot resume`. |
 | Re-run a failed day | `./bin/tradebot run --broker robinhood --force`. Order IDs are deterministic per day, but check the app for partial submissions first. |
 | Change parameters | Edit `configs/config.yaml`, re-run `make backtest sweep`, and paper-trade the change before going live. |

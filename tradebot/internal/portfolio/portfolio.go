@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/midhunvinay1/tradebot/internal/config"
+	"github.com/midhunvinay1/tradebot/internal/market"
 )
 
 const (
@@ -124,10 +125,5 @@ func RoundQty(q float64, fractional bool) float64 {
 	return math.Floor(q)
 }
 
-// RoundPrice rounds to a valid US equity tick: $0.01 at or above $1, $0.0001 below.
-func RoundPrice(p float64) float64 {
-	if p >= 1 {
-		return math.Round(p*100) / 100
-	}
-	return math.Round(p*1e4) / 1e4
-}
+// RoundPrice rounds to a valid US equity tick.
+func RoundPrice(p float64) float64 { return market.RoundTick(p) }

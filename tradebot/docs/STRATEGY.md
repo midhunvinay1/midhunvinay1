@@ -1,5 +1,7 @@
 # Strategy: Regime-Filtered Momentum + Mean Reversion, Vol-Targeted, Claude-Reviewed
 
+> This document covers the **swing** mode (`tradebot run`). The short-term **intraday** mode (`tradebot day`, opening-range breakout) is described in [INTRADAY.md](INTRADAY.md).
+
 **Goal:** medium risk (equity-like volatility or less, with controlled drawdowns) and the highest return that has credible evidence behind it. Tradeable through Robinhood with daily decisions.
 
 > **Honest expectation-setting.** No strategy can promise high returns. Published anomalies lose about a quarter of their strength out of sample and about half after publication (McLean & Pontiff, 2016). Backtests overstate live results. The aim here is **better risk-adjusted returns than buy-and-hold with smaller drawdowns**, validated on *your* real-data backtest and paper trading before any real money is used.
@@ -13,7 +15,7 @@
 | **Volatility targeting** | Moreira & Muir (2017); Barroso & Santa-Clara (2015) ("momentum has its moments"): raises Sharpe and reduces momentum crashes (Daniel & Moskowitz, 2016) | Pure position sizing | ✅ **Sizing** |
 | **Short-term mean reversion (RSI(2) in uptrends)** | Connors & Alvarez (2009); long-documented short-term reversal effect | High win rate, holds for days; diversifies momentum | ✅ **Second sleeve** |
 | LLM news sentiment as the alpha | Lopez-Lira & Tang (2023): headline sentiment predicts next-day returns, mostly in small caps, and the effect decays quickly | Next-day horizon, small caps, fast decay; can't be backtested honestly | ⚠️ Used only as a **risk filter** |
-| Opening-range breakout day trading | Zarattini & Aziz (2023) report strong results on "stocks in play" | Needs intraday data, fast execution, and $25k to avoid PDT limits; per-trade MCP round trips | ❌ Not a fit |
+| Opening-range breakout day trading | Zarattini & Aziz (2023) report strong results on "stocks in play" | Needs intraday data and fast execution; the PDT $25k rule was removed in 2026 | ➡️ Implemented as the separate **intraday mode** (needs the native MCP client) |
 | Selling options (premium harvesting) | Positive carry, but short-volatility tail risk | Not "medium risk"; approval levels | ❌ |
 | Pure "Claude picks stocks" | No robust evidence; untestable because of look-ahead contamination | none | ❌ |
 

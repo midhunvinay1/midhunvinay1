@@ -2,6 +2,7 @@
 package market
 
 import (
+	"math"
 	"sort"
 	"time"
 )
@@ -83,6 +84,14 @@ func SortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// RoundTick rounds to a valid US equity tick: $0.01 at or above $1, $0.0001 below.
+func RoundTick(p float64) float64 {
+	if p >= 1 {
+		return math.Round(p*100) / 100
+	}
+	return math.Round(p*1e4) / 1e4
 }
 
 // Day normalizes t to its calendar date at 00:00 UTC.

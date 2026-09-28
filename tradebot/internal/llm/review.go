@@ -193,41 +193,56 @@ func oneLine(s string, limit int) string {
 }
 
 func (c *Claude) Review(ctx context.Context, cand Candidate) (Verdict, error) {
-	msg := UserMessage(cand)
-	sum := sha256.Sum256([]byte(c.model + "\x00" + PromptVersion + "\x00" + msg))
-	cachePath := filepath.Join(c.cacheDir, hex.EncodeToString(sum[:])+".json")
-	if b, err := os.ReadFile(cachePath); err == nil {
+	b, err := c.ask(ctx, PromptVersion, systemPrompt, UserMessage(cand), verdictSchema, func(b []byte) error {
 		var v Verdict
-		if json.Unmarshal(b, &v) == nil {
-			return v, nil
+		if err := json.Unmarshal(b, &v); err != nil {
+			return fmt.Errorf("invalid JSON verdict: %w", err)
 		}
+		if v.Decision != "approve" && v.Decision != "reduce" && v.Decision != "veto" {
+			return fmt.Errorf("invalid decision %q", v.Decision)
+		}
+		return nil
+	})
+	if err != nil {
+		return Verdict{}, err
 	}
+	var v Verdict
+	return v, json.Unmarshal(b, &v)
+}
 
+// ask makes one structured-output call, validated by check and cached on
+// disk by hash(model, prompt version, message).
+func (c *Claude) ask(ctx context.Context, version, system, msg string, schema map[string]any, check func([]byte) error) ([]byte, error) {
+	sum := sha256.Sum256([]byte(c.model + "\x00" + version + "\x00" + msg))
+	cachePath := filepath.Join(c.cacheDir, hex.EncodeToString(sum[:])+".json")
+	if b, err := os.ReadFile(cachePath); err == nil && check(b) == nil {
+		return b, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 	resp, err := c.client.Beta.Messages.New(ctx, anthropic.BetaMessageNewParams{
 		Model:     c.model,
 		MaxTokens: 16000,
 		System: []anthropic.BetaTextBlockParam{{
-			Text: systemPrompt, CacheControl: anthropic.NewBetaCacheControlEphemeralParam(),
+			Text: system, CacheControl: anthropic.NewBetaCacheControlEphemeralParam(),
 		}},
 		Messages: []anthropic.BetaMessageParam{anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(msg))},
 		OutputConfig: anthropic.BetaOutputConfigParam{
 			Effort: anthropic.BetaOutputConfigEffort(c.effort),
-			Format: anthropic.BetaJSONOutputFormatParam{Schema: verdictSchema},
+			Format: anthropic.BetaJSONOutputFormatParam{Schema: schema},
 		},
 		// Server-side refusal fallback: a declined request is re-served by a fallback model.
 		Fallbacks: anthropic.BetaFallbacksParamUnion{OfDefault: constant.ValueOf[constant.Default]()},
 		Betas:     []anthropic.AnthropicBeta{anthropic.AnthropicBetaServerSideFallback2026_07_01},
 	})
 	if err != nil {
-		return Verdict{}, fmt.Errorf("claude: %w", err)
+		return nil, fmt.Errorf("claude: %w", err)
 	}
 	if resp.StopReason == anthropic.BetaStopReasonRefusal {
-		return Verdict{}, fmt.Errorf("claude refused: %s", resp.StopDetails.Explanation)
+		return nil, fmt.Errorf("claude refused: %s", resp.StopDetails.Explanation)
 	}
 	if resp.StopReason == anthropic.BetaStopReasonMaxTokens {
-		return Verdict{}, fmt.Errorf("claude hit max_tokens")
+		return nil, fmt.Errorf("claude hit max_tokens")
 	}
 	var text strings.Builder
 	for _, block := range resp.Content {
@@ -235,15 +250,10 @@ func (c *Claude) Review(ctx context.Context, cand Candidate) (Verdict, error) {
 			text.WriteString(t.Text)
 		}
 	}
-	var v Verdict
-	if err := json.Unmarshal([]byte(text.String()), &v); err != nil {
-		return Verdict{}, fmt.Errorf("claude: invalid JSON verdict: %w", err)
+	b := []byte(text.String())
+	if err := check(b); err != nil {
+		return nil, fmt.Errorf("claude: %w", err)
 	}
-	if v.Decision != "approve" && v.Decision != "reduce" && v.Decision != "veto" {
-		return Verdict{}, fmt.Errorf("claude: invalid decision %q", v.Decision)
-	}
-	if b, err := json.Marshal(v); err == nil {
-		_ = os.WriteFile(cachePath, b, 0o644)
-	}
-	return v, nil
+	_ = os.WriteFile(cachePath, b, 0o644)
+	return b, nil
 }
