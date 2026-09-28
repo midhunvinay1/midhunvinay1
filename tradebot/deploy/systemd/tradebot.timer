@@ -1,0 +1,9 @@
+[Unit]
+Description=Run tradebot on weekdays at 09:40 New York time
+
+[Timer]
+OnCalendar=Mon..Fri 09:40 America/New_York
+Persistent=false
+
+[Install]
+WantedBy=timers.target

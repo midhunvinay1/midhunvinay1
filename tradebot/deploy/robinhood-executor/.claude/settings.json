@@ -1,0 +1,19 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$TRADEBOT_BIN\" hook pretooluse",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "deny": ["Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task"]
+  }
+}

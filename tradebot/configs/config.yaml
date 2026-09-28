@@ -1,0 +1,153 @@
+# tradebot configuration. Every value here overrides the built-in default.
+# Risk settings are enforced by deterministic code; Claude cannot change them.
+
+# Trading universe: liquid ETFs and large caps (whole-share limit orders).
+# NOTE: a fixed list of today's winners creates survivorship bias in backtests.
+universe:
+  - SPY
+  - QQQ
+  - IWM
+  - DIA
+  - XLK
+  - XLF
+  - XLE
+  - XLV
+  - XLY
+  - XLP
+  - XLI
+  - XLU
+  - XLB
+  - SMH
+  - GLD
+  - TLT
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMZN
+  - GOOGL
+  - META
+  - AVGO
+  - TSLA
+  - JPM
+  - V
+  - MA
+  - UNH
+  - LLY
+  - XOM
+  - COST
+  - HD
+  - NFLX
+  - AMD
+  - CRM
+  - ORCL
+  - ADBE
+  - PEP
+  - KO
+  - WMT
+  - BAC
+  - CAT
+benchmark: SPY        # regime filter and performance benchmark
+defensive: SGOV       # momentum sleeve holds this in risk-off regimes ("" = cash). SGOV starts 2020-06; use BIL for longer backtests.
+
+strategy:
+  regime_sma: 200     # risk-on when benchmark is above its 200-day SMA
+  regime_band: 0.01   # 1% hysteresis to avoid whipsaws
+  momentum:
+    weight: 0.6       # share of capital for the trend sleeve
+    top_n: 5
+    lookbacks: [63, 126, 252]   # 3, 6, 12 months
+    skip: 21                    # skip the most recent month (short-term reversal)
+    vol_window: 63
+    rebalance_days: 21          # monthly
+    trend_sma: 100              # only buy names above their 100-day SMA
+    trail_atr_mult: 3.0         # chandelier stop: 3 ATR below the high since entry
+    atr_window: 20
+  mean_reversion:
+    weight: 0.4
+    max_positions: 4
+    rsi_period: 2
+    entry_rsi: 10               # buy when RSI(2) < 10 ...
+    trend_sma: 200              # ... and the stock is above its 200-day SMA
+    exit_sma: 5                 # sell when close > 5-day SMA
+    max_hold_days: 10
+    stop_atr_mult: 2.5
+    atr_window: 20
+    require_risk_on: true
+  target_vol: 0.18              # scale down when ex-ante portfolio vol > 18%/yr ("medium risk")
+  vol_window: 63
+  max_symbol_weight: 0.25
+  min_price: 5
+  min_dollar_volume: 20000000   # 20-day average dollar volume
+  liquidity_window: 20
+
+execution:
+  entry_limit_bps: 30           # buy limit = reference price + 0.30%
+  exit_limit_bps: 100           # sell limit = reference price - 1.00% (exits should fill)
+  rebalance_band: 0.02          # ignore resizes smaller than 2% of equity
+  allow_fractional: false
+  min_order_notional: 25
+
+risk:
+  max_position_weight: 0.30
+  max_gross_exposure: 1.0       # never uses margin
+  max_orders_per_run: 20
+  max_turnover_per_run: 1.2
+  daily_loss_limit: 0.04        # no new buys after a 4% down day
+  soft_drawdown: 0.15           # halve exposure at 15% drawdown
+  soft_drawdown_scale: 0.5
+  hard_drawdown: 0.25           # kill switch at 25% drawdown (needs `tradebot resume`)
+  max_price_deviation_bps: 150
+  max_data_age_days: 5
+  deny_symbols: []
+  halt_allows_exits: true       # when halted, sell to cash; set false to freeze entirely
+
+backtest:
+  initial_equity: 10000
+  slippage_bps: 5
+  risk_free_rate: 0.0
+  start: ""
+  end: ""
+
+llm:
+  enabled: true
+  model: claude-opus-5
+  effort: medium
+  review_new_entries: true
+  on_error: skip                # fail closed: if Claude is unavailable, skip new entries
+  max_calls_per_run: 10
+  news_lookback_days: 7
+  max_headlines: 10
+  api_key_env: ANTHROPIC_API_KEY
+
+alpaca:
+  key_env: APCA_API_KEY_ID
+  secret_env: APCA_API_SECRET_KEY
+  data_feed: sip                # historical bars (free plan: SIP older than 15 minutes)
+  price_feed: iex               # latest prices (free plan: IEX)
+  data_base_url: https://data.alpaca.markets
+  trading_base_url: https://paper-api.alpaca.markets   # paper only; live goes through Robinhood
+
+robinhood:
+  claude_bin: claude
+  executor_dir: deploy/robinhood-executor
+  mcp_server: robinhood-trading
+  timeout_minutes: 10
+  intent_ttl_minutes: 30
+  price_tolerance_bps: 50
+  # Tool classification for the PreToolUse guard. Verify against the real tool
+  # names (run `/mcp` in Claude Code) before going live; unknown tools are denied.
+  order_tool_keywords: [place, submit, create_order, buy, sell]
+  read_tool_keywords: [get, list, search, quote, portfolio, position, holding, balance, status]
+  deny_keywords: [transfer, withdraw, deposit, bank, cancel, close_all, liquidate, option, crypto, margin, setting, update, delete, disconnect]
+  fields:
+    symbol: [symbol, ticker, instrument_symbol]
+    side: [side, action, direction]
+    quantity: [quantity, qty, shares]
+    limit_price: [limit_price, price, limit]
+    order_type: [order_type, type]
+  forbidden_input_keys: [strike, strike_price, expiration, expiration_date, option_type, legs, notional, dollar_amount, amount_in_dollars, stop_price, trail_amount]
+
+notify:
+  webhook_url_env: TRADEBOT_WEBHOOK_URL   # optional Slack-compatible incoming webhook
+
+state_dir: state
