@@ -1,5 +1,7 @@
 # tradebot
 
+> **Want no LLM at all?** Use **`trendbot`**: diversified multi-asset trend following with momentum rotation and volatility targeting, rebalanced monthly. It links no LLM code (CI-verified). See [docs/TRENDBOT.md](docs/TRENDBOT.md) for why I consider it the most robust strategy here.
+
 A **Go** trading bot for **Robinhood** with two modes:
 - **Swing** (`tradebot run`, once a day): regime-filtered momentum plus mean reversion, with a volatility target.
 - **Intraday** (`tradebot day`, short-term): a 5-minute opening-range breakout on "stocks in play", with ~2 s decisions, always flat by the close.
@@ -16,6 +18,7 @@ In both modes, deterministic code decides the trades. **Claude** can only shrink
 
 | Doc | What's inside |
 |---|---|
+| [docs/TRENDBOT.md](docs/TRENDBOT.md) | **trendbot** (LLM-free): why this strategy, rules, evidence, how to run |
 | [docs/STRATEGY.md](docs/STRATEGY.md) | Which strategies were considered, the rules, the evidence, honest expectations |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Components, daily cycle, Robinhood execution design, safety layers, why Go |
 | [docs/INTRADAY.md](docs/INTRADAY.md) | Short-term mode: ORB rules, latency, why not real HFT, base rates, PDT/settlement |

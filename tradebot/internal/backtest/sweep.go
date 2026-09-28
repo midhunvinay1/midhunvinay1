@@ -10,6 +10,7 @@ import (
 
 	"github.com/midhunvinay1/tradebot/internal/config"
 	"github.com/midhunvinay1/tradebot/internal/market"
+	"github.com/midhunvinay1/tradebot/internal/strategy"
 )
 
 // SweepRow is one parameter combination scored in-sample and out-of-sample.
@@ -50,6 +51,11 @@ func DefaultGrid() [][]Variant {
 // out-of-sample window [split, end]. Pick parameters from a broad stable
 // region, never from the single best in-sample row.
 func Sweep(ctx context.Context, base *config.Config, data market.Dataset, grid [][]Variant, start, split, end time.Time, workers int) ([]SweepRow, error) {
+	return SweepWith(ctx, base, data, grid, func(c *config.Config) Planner { return strategy.New(c, nil) }, start, split, end, workers)
+}
+
+// SweepWith sweeps any strategy; newPlanner builds a fresh planner per run.
+func SweepWith(ctx context.Context, base *config.Config, data market.Dataset, grid [][]Variant, newPlanner func(*config.Config) Planner, start, split, end time.Time, workers int) ([]SweepRow, error) {
 	combos := [][]Variant{{}}
 	for _, dim := range grid {
 		var next [][]Variant
@@ -71,17 +77,18 @@ func Sweep(ctx context.Context, base *config.Config, data market.Dataset, grid [
 			for i := range jobs {
 				cfg := *base
 				cfg.Strategy.Momentum.Lookbacks = append([]int{}, base.Strategy.Momentum.Lookbacks...)
+				cfg.Trend.Lookbacks = append([]int{}, base.Trend.Lookbacks...)
 				name := ""
 				for _, v := range combos[i] {
 					v.Apply(&cfg)
 					name += v.Name + " "
 				}
-				is, err := Run(ctx, &cfg, data, Options{Start: start, End: split.AddDate(0, 0, -1)})
+				is, err := RunWith(ctx, &cfg, data, newPlanner(&cfg), Options{Start: start, End: split.AddDate(0, 0, -1)})
 				if err != nil {
 					errs[i] = err
 					continue
 				}
-				oos, err := Run(ctx, &cfg, data, Options{Start: split, End: end})
+				oos, err := RunWith(ctx, &cfg, data, newPlanner(&cfg), Options{Start: split, End: end})
 				if err != nil {
 					errs[i] = err
 					continue

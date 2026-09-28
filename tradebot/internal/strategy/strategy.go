@@ -106,6 +106,9 @@ func New(cfg *config.Config, st *State) *Engine {
 	return e
 }
 
+// State returns the persistable state.
+func (e *Engine) State() any { return e.St }
+
 // Reconcile confirms pending entries that were filled. A mean-reversion entry
 // that did not fill is dropped, because its signal is stale by the next day.
 // A momentum entry that did not fill is retried until the next rebalance.

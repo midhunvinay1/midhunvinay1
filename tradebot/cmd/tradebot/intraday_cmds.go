@@ -22,11 +22,8 @@ import (
 	"github.com/midhunvinay1/tradebot/internal/notify"
 )
 
-// nativeBroker builds the direct Robinhood MCP client. Its OAuth token lives in
-// state/robinhood-native whatever mode uses it.
 func nativeBroker(cfg *config.Config, interactive bool) *broker.RobinhoodNative {
-	return &broker.RobinhoodNative{Cfg: cfg.Robinhood, StateDir: filepath.Join(cfg.StateDir, "robinhood-native"),
-		Interactive: interactive, Out: os.Stdout}
+	return broker.NewRobinhoodNative(cfg, interactive, os.Stdout)
 }
 
 func cmdFetchIntraday(ctx context.Context, args []string) error {

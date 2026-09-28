@@ -21,6 +21,7 @@ type Config struct {
 	Robinhood RobinhoodConfig `yaml:"robinhood"`
 	Notify    NotifyConfig    `yaml:"notify"`
 	Intraday  IntradayConfig  `yaml:"intraday"`
+	Trend     TrendConfig     `yaml:"trend"`
 	StateDir  string          `yaml:"state_dir"`
 }
 
@@ -183,6 +184,17 @@ type IntradayConfig struct {
 	AllowSlowExecutor   bool     `yaml:"allow_slow_executor"` // allow the Claude Code executor intraday (10-30 s per order)
 }
 
+// TrendConfig configures trendbot: multi-asset trend following with
+// momentum rotation and volatility targeting (no LLM anywhere).
+type TrendConfig struct {
+	Lookbacks []int   `yaml:"lookbacks"`  // momentum horizons in trading days (averaged)
+	TopK      int     `yaml:"top_k"`      // number of asset slots; unfilled slots stay in cash
+	VolWindow int     `yaml:"vol_window"` // days for inverse-volatility weights and covariance
+	TargetVol float64 `yaml:"target_vol"` // cap on ex-ante portfolio volatility (0 = off)
+	MaxWeight float64 `yaml:"max_weight"` // cap per asset; the excess stays in cash
+	Rebalance string  `yaml:"rebalance"`  // month | week
+}
+
 // IntradaySymbols returns the intraday universe (defaults to the main universe).
 func (c *Config) IntradaySymbols() []string {
 	if len(c.Intraday.Universe) > 0 {
@@ -263,6 +275,20 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("intraday.poll_seconds must be >= 1 (data API rate limits)")
 	case in.OpeningRangeMinutes < 1 || in.StopATRFraction <= 0:
 		return fmt.Errorf("intraday.opening_range_minutes and stop_atr_fraction must be positive")
+	}
+	tc := c.Trend
+	switch {
+	case len(tc.Lookbacks) == 0 || tc.TopK <= 0 || tc.VolWindow < 2:
+		return fmt.Errorf("trend: lookbacks, top_k and vol_window are required")
+	case tc.MaxWeight <= 0 || tc.MaxWeight > 1:
+		return fmt.Errorf("trend.max_weight must be in (0,1]")
+	case tc.Rebalance != "month" && tc.Rebalance != "week":
+		return fmt.Errorf("trend.rebalance must be month or week")
+	}
+	for _, lb := range tc.Lookbacks {
+		if lb < 1 {
+			return fmt.Errorf("trend.lookbacks must be positive")
+		}
 	}
 	for _, hm := range []string{in.NoEntriesAfter, in.FlattenAt} {
 		if _, err := ParseClock(hm); err != nil {
@@ -368,6 +394,9 @@ func Defaults() *Config {
 			MaxTradesPerDay: 8, NoEntriesAfter: "15:00", FlattenAt: "15:55", DailyLossLimit: 0.02, AccountType: "cash",
 			EntryLimitBps: 10, ExitLimitBps: 30, SlippageBps: 3, PollSeconds: 2, MaxQuoteAgeSeconds: 10,
 			OrderTimeoutSeconds: 20, PremarketReview: true, NewsLookbackHours: 18,
+		},
+		Trend: TrendConfig{
+			Lookbacks: []int{21, 63, 126, 252}, TopK: 4, VolWindow: 63, TargetVol: 0.15, MaxWeight: 0.35, Rebalance: "month",
 		},
 		StateDir: "state",
 	}

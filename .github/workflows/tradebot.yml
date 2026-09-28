@@ -25,5 +25,7 @@ jobs:
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - run: go vet ./...
       - run: go test -race ./...
-      - name: Synthetic smoke backtest
-        run: make synth-backtest
+      - name: trendbot links no LLM code
+        run: make check-llm-free
+      - name: Synthetic smoke backtests
+        run: make synth-backtest trend-synth

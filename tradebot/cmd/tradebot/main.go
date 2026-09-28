@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,24 +14,26 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/midhunvinay1/tradebot/internal/alpaca"
 	"github.com/midhunvinay1/tradebot/internal/backtest"
 	"github.com/midhunvinay1/tradebot/internal/broker"
+	"github.com/midhunvinay1/tradebot/internal/cliutil"
 	"github.com/midhunvinay1/tradebot/internal/config"
 	"github.com/midhunvinay1/tradebot/internal/data"
 	"github.com/midhunvinay1/tradebot/internal/hook"
 	"github.com/midhunvinay1/tradebot/internal/intraday"
 	"github.com/midhunvinay1/tradebot/internal/journal"
 	"github.com/midhunvinay1/tradebot/internal/llm"
+	"github.com/midhunvinay1/tradebot/internal/llmreview"
 	"github.com/midhunvinay1/tradebot/internal/lock"
 	"github.com/midhunvinay1/tradebot/internal/market"
 	"github.com/midhunvinay1/tradebot/internal/notify"
 	"github.com/midhunvinay1/tradebot/internal/risk"
 	"github.com/midhunvinay1/tradebot/internal/runner"
+	"github.com/midhunvinay1/tradebot/internal/strategy"
 )
 
 const usage = `tradebot — momentum + mean-reversion swing bot with a Claude risk overlay
@@ -119,13 +120,7 @@ func loadConfig(fs *flag.FlagSet, args []string) (*config.Config, string, error)
 	return cfg, abs, nil
 }
 
-func parseDate(s string) (time.Time, error) {
-	if s == "" {
-		return time.Time{}, nil
-	}
-	t, err := time.Parse("2006-01-02", s)
-	return market.Day(t), err
-}
+var parseDate = cliutil.ParseDate
 
 func cmdFetch(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
@@ -226,53 +221,9 @@ func cmdBacktest(ctx context.Context, args []string) error {
 	return writeResults(*out, res)
 }
 
-func writeResults(dir string, res *backtest.Result) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
-	}
-	b, _ := json.MarshalIndent(res, "", "  ")
-	if err := os.WriteFile(filepath.Join(dir, "summary.json"), b, 0o644); err != nil {
-		return err
-	}
-	f2 := func(x float64) string { return strconv.FormatFloat(x, 'f', 4, 64) }
-	rows := [][]string{{"date", "equity", "cash", "gross", "benchmark"}}
-	for _, p := range res.Equity {
-		rows = append(rows, []string{p.Date.Format("2006-01-02"), f2(p.Equity), f2(p.Cash), f2(p.Gross), f2(p.Benchmark)})
-	}
-	if err := writeCSV(filepath.Join(dir, "equity.csv"), rows); err != nil {
-		return err
-	}
-	rows = [][]string{{"symbol", "entry_date", "exit_date", "cost", "pnl", "pnl_pct", "hold_days"}}
-	for _, t := range res.Trades {
-		rows = append(rows, []string{t.Symbol, t.EntryDate.Format("2006-01-02"), t.ExitDate.Format("2006-01-02"),
-			f2(t.Cost), f2(t.PnL), f2(t.PnLPct), strconv.Itoa(t.HoldDays)})
-	}
-	if err := writeCSV(filepath.Join(dir, "trades.csv"), rows); err != nil {
-		return err
-	}
-	rows = [][]string{{"date", "symbol", "side", "qty", "price", "kind", "reason"}}
-	for _, f := range res.Fills {
-		rows = append(rows, []string{f.Date.Format("2006-01-02"), f.Symbol, f.Side, f2(f.Qty), f2(f.Price), f.Kind, f.Reason})
-	}
-	if err := writeCSV(filepath.Join(dir, "fills.csv"), rows); err != nil {
-		return err
-	}
-	fmt.Printf("Wrote %s/{summary.json,equity.csv,trades.csv,fills.csv}\n", dir)
-	return nil
-}
+var writeResults = cliutil.WriteBacktest
 
-func writeCSV(path string, rows [][]string) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	w := csv.NewWriter(f)
-	if err := w.WriteAll(rows); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
-}
+var writeCSV = cliutil.WriteCSV
 
 func cmdSweep(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("sweep", flag.ExitOnError)
@@ -358,20 +309,20 @@ func cmdRun(ctx context.Context, args []string) error {
 		return fmt.Errorf("unknown broker %q", *brokerName)
 	}
 
-	var rev llm.Reviewer = llm.ApproveAll{}
-	if cfg.LLM.Enabled {
-		c, err := llm.NewClaude(cfg.LLM, stateDir)
-		if err != nil {
-			return err
-		}
-		rev = c
-	}
 	j, err := journal.Open(stateDir)
 	if err != nil {
 		return err
 	}
+	var rev runner.EntryReviewer
+	if cfg.LLM.Enabled && cfg.LLM.ReviewNewEntries {
+		c, err := llm.NewClaude(cfg.LLM, stateDir)
+		if err != nil {
+			return err
+		}
+		rev = &llmreview.Reviewer{Cfg: cfg.LLM, LLM: c, News: src.News, Journal: j}
+	}
 	r := &runner.Runner{
-		Cfg: cfg, StateDir: stateDir, Broker: b, Data: src, Reviewer: rev, Journal: j,
+		Cfg: cfg, StateDir: stateDir, Broker: b, Data: src, NewPlanner: runner.SwingPlanner(cfg), Reviewer: rev, Journal: j,
 		Notify: notify.New(cfg.Notify.WebhookURLEnv), Now: time.Now, Force: *force, Out: os.Stdout,
 	}
 	return r.Run(ctx)
@@ -405,8 +356,10 @@ func cmdKill(which string, args []string) error {
 		rk := risk.New(cfg, st.Risk, risk.HaltFilePath(dir))
 		if !applyKill(which, rk, dir, bn, *reason) {
 			h, why := rk.Halted()
+			var ss strategy.State
+			_ = json.Unmarshal(st.Strategy, &ss)
 			fmt.Printf("%s: halted=%v %s | peak equity %.2f | last run %s | momentum %d | mean-reversion %d\n", bn, h, why,
-				st.Risk.PeakEquity, st.LastRunDate.Format("2006-01-02"), len(st.Strategy.Momentum), len(st.Strategy.MeanRev))
+				st.Risk.PeakEquity, st.LastRunDate.Format("2006-01-02"), len(ss.Momentum), len(ss.MeanRev))
 			continue
 		}
 		st.Risk = rk.St
